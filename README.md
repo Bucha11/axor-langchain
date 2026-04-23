@@ -1,5 +1,10 @@
 # axor-langchain
 
+[![CI](https://github.com/Bucha11/axor-langchain/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Bucha11/axor-langchain/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/axor-langchain?cacheSeconds=300)](https://pypi.org/project/axor-langchain/)
+[![Python](https://img.shields.io/pypi/pyversions/axor-langchain?cacheSeconds=300)](https://pypi.org/project/axor-langchain/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Cut token costs 40–80% in LangChain multi-agent pipelines.**
 
 One middleware. No graph changes. Works with any `create_agent()` agent.

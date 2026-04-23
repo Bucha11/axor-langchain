@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-core    = ["axor-core>=0.1.0"]           # enables ContextCompressor + BudgetTracker
+core    = ["axor-core>=0.2.0"]           # enables ContextCompressor + BudgetTracker
 memory  = ["axor-memory-sqlite>=0.1.0"]  # cross-session memory
 dev     = ["pytest>=7.0", "pytest-asyncio"]
 
