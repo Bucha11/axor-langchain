@@ -12,9 +12,75 @@ The actual AgentMiddleware subclass is built lazily so the package is
 importable without langchain installed (useful for unit tests).
 """
 
+import os
+import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
+
+
+_TELEMETRY_MARKER = Path.home() / ".axor" / ".telemetry_notice_shown"
+
+
+def _maybe_show_telemetry_notice() -> None:
+    """
+    Print a single-line stderr notice about anonymous telemetry the first
+    time AxorMiddleware is constructed on a given machine. Idempotent.
+    Suppressed by AXOR_NO_BANNER=1.
+    """
+    if os.environ.get("AXOR_NO_BANNER") == "1":
+        return
+    if _TELEMETRY_MARKER.is_file():
+        return
+    sys.stderr.write(
+        "axor: anonymous telemetry is off. "
+        "Set AXOR_TELEMETRY=local or pass telemetry='local' to help tune "
+        "the classifier. (shown once; suppress with AXOR_NO_BANNER=1)\n"
+    )
+    try:
+        _TELEMETRY_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        _TELEMETRY_MARKER.write_text("shown\n", encoding="utf-8")
+    except OSError:
+        return
+
+
+def _resolve_telemetry_mode(kwarg_value: str | None) -> str:
+    """kwarg wins; then AXOR_TELEMETRY env; else 'off'."""
+    if kwarg_value is not None:
+        return str(kwarg_value).lower()
+    env = os.environ.get("AXOR_TELEMETRY")
+    if env:
+        return env.lower()
+    return "off"
+
+
+def _build_telemetry_pipeline(mode: str, axor_version: str) -> Any | None:
+    """
+    Construct a pipeline for the given resolved mode string. Returns None
+    when axor-telemetry is not installed or mode is 'off'. Never raises.
+    """
+    if mode == "off":
+        return None
+    try:
+        from axor_telemetry import TelemetryConfig, TelemetryMode, build_pipeline
+    except ImportError:
+        return None
+    try:
+        tmode = TelemetryMode(mode)
+    except ValueError:
+        return None
+    base = TelemetryConfig.load()
+    cfg = TelemetryConfig(
+        mode=tmode,
+        endpoint=base.endpoint,
+        queue_path=base.queue_path,
+        fingerprint_kind=base.fingerprint_kind,
+    )
+    try:
+        return build_pipeline(config=cfg, axor_version=axor_version)
+    except Exception:
+        return None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -339,6 +405,7 @@ class _AxorGovernanceCore:
         tool_retry_delay: float = 0.0,
         track_tool_stats: bool = False,
         verbose: bool = False,
+        telemetry: str | None = None,
     ) -> None:
         self._soft_limit   = soft_token_limit
         self._hard_limit   = hard_token_limit or (
@@ -367,6 +434,25 @@ class _AxorGovernanceCore:
         self._budget_tracker: Any = None
         self._budget_engine: Any = None
         self._engines_ready = False
+
+        # Telemetry: build a pipeline when caller opts in via kwarg or
+        # AXOR_TELEMETRY env. A one-time notice is printed to stderr when
+        # telemetry is off, so new users discover the option.
+        self._telemetry_mode = _resolve_telemetry_mode(telemetry)
+        self._telemetry = _build_telemetry_pipeline(
+            mode=self._telemetry_mode,
+            axor_version=self._axor_version(),
+        )
+        if self._telemetry_mode == "off":
+            _maybe_show_telemetry_notice()
+
+    @staticmethod
+    def _axor_version() -> str:
+        try:
+            from axor_langchain import __version__  # type: ignore
+            return __version__
+        except Exception:
+            return ""
 
     # ── lazy engine init ──────────────────────────────────────────────────────
 
@@ -822,6 +908,7 @@ def _make_axor_middleware_class():
             runtime: Runtime,
         ) -> dict[str, Any] | None:
             self.after_agent(state, runtime)
+            await self._record_telemetry(state)
             if self._memory_provider is None:
                 return None
             try:
@@ -842,6 +929,38 @@ def _make_axor_middleware_class():
                 if self._verbose:
                     print(f"[axor] memory save failed: {e}")
             return None
+
+        async def _record_telemetry(self, state) -> None:
+            """
+            Classify the latest human message with axor-core's TaskAnalyzer
+            and forward one AnonymizedTraceRecord to the telemetry sink.
+            Silent no-op if telemetry is off or axor-core is not available.
+            """
+            if self._telemetry is None or not getattr(self._telemetry, "enabled", False):
+                return
+            try:
+                messages = state.get("messages", [])
+                human = None
+                for m in messages:
+                    if getattr(m, "type", None) == "human":
+                        human = _msg_text(m)
+                if not human:
+                    return
+                from axor_core.policy.analyzer import TaskAnalyzer
+                analyzer = TaskAnalyzer()
+                signal, event = await analyzer.analyze(human)
+                tokens = self._budget_tracker.total_tokens() if self._engines_ready else 0
+                await self._telemetry.record_decision(
+                    raw_input=human,
+                    signal=signal,
+                    classifier_used=event.classifier,
+                    confidence=float(event.confidence),
+                    tokens_spent=int(tokens),
+                    policy_adjusted=False,
+                )
+            except Exception as e:
+                if self._verbose:
+                    print(f"[axor] telemetry record failed: {e}")
 
     AxorMiddlewareImpl.__name__ = "AxorMiddleware"
     return AxorMiddlewareImpl
@@ -943,6 +1062,7 @@ class AxorMiddleware(_AxorGovernanceCore):
         tool_retry_delay: float = 0.0,
         track_tool_stats: bool = False,
         verbose: bool = False,
+        telemetry: str | None = None,
     ) -> None:
         # Guard against double init — __new__ already called __init__
         # on AxorMiddlewareImpl instances
@@ -964,4 +1084,5 @@ class AxorMiddleware(_AxorGovernanceCore):
             tool_retry_delay=tool_retry_delay,
             track_tool_stats=track_tool_stats,
             verbose=verbose,
+            telemetry=telemetry,
         )
