@@ -9,6 +9,8 @@
 
 One middleware. No graph changes. Works with any `create_agent()` agent.
 
+![demo](docs/demo.svg)
+
 ---
 
 ## The problem
