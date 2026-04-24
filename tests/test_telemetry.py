@@ -1,10 +1,17 @@
-"""Telemetry integration tests for AxorMiddleware."""
+"""Telemetry integration tests for AxorMiddleware.
+
+Skipped when axor-telemetry is not installed (e.g. public CI without the
+sibling package). Install locally with `pip install -e "../axor-telemetry"`
+for full coverage.
+"""
 from __future__ import annotations
 
 import asyncio
 import sys
 
 import pytest
+
+pytest.importorskip("axor_telemetry")
 
 
 @pytest.fixture(autouse=True)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "axor-langchain"
-version = "0.2.0"
+version = "0.3.0"
 description = "Governance middleware for LangChain 1.0 agents — powered by axor-core compression engines"
 readme = "README.md"
 license = { text = "MIT" }
@@ -24,9 +24,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-core    = ["axor-core>=0.2.0"]           # enables ContextCompressor + BudgetTracker
-memory  = ["axor-memory-sqlite>=0.1.0"]  # cross-session memory
-dev     = ["pytest>=7.0", "pytest-asyncio"]
+core      = ["axor-core>=0.2.0"]           # enables ContextCompressor + BudgetTracker
+memory    = ["axor-memory-sqlite>=0.1.0"]  # cross-session memory
+telemetry = ["axor-telemetry>=0.1.0"]      # anonymous opt-in classifier signals
+dev       = ["pytest>=7.0", "pytest-asyncio"]
+# tests/test_telemetry.py auto-skips when axor-telemetry is not installed
+# (see pytest.importorskip at the top of that file). Install locally with
+# `pip install -e ".[telemetry]" -e "../axor-telemetry"` for full coverage.
 
 [tool.hatch.build.targets.wheel]
 packages = ["axor_langchain"]

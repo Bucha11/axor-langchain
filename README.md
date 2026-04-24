@@ -135,6 +135,35 @@ axor = AxorMiddleware(
 # next session: load with provider.load(MemoryQuery(...))
 ```
 
+### Anonymous telemetry (opt-in)
+
+```bash
+pip install axor-langchain[telemetry]
+```
+
+```python
+# explicit kwarg
+axor = AxorMiddleware(telemetry="local")    # append to local JSONL queue
+axor = AxorMiddleware(telemetry="remote")   # also ship to telemetry.useaxor.net
+
+# or env (no code change)
+# AXOR_TELEMETRY=local  or  AXOR_TELEMETRY=remote
+```
+
+**What gets sent** (only with `remote`, only when opted in):
+
+- chosen signal (`focused_generative`, etc), classifier confidence, tokens spent
+- 128-int MinHash fingerprint of the task — non-reversible
+- whether policy was corrected mid-run, `axor_version`
+
+**Never sent:** raw task text, file contents, tool arguments, secrets, user/session IDs. IP is hashed SHA-256 truncated to 16 chars, used only for rate-limit buckets.
+
+Live community aggregates and the full data contract:
+[telemetry.useaxor.net/stats](https://telemetry.useaxor.net/stats). Suppress
+the one-time opt-in notice with `AXOR_NO_BANNER=1`.
+
+Default is **off** — nothing leaves your machine without an explicit opt-in.
+
 ### Small context bypass
 
 By default, contexts under 4,000 tokens skip the compression pipeline entirely. This avoids overhead on small/early turns where compression can't save more than it costs:
@@ -230,6 +259,7 @@ AxorMiddleware(
     tool_retry_delay=0.0,            # float — seconds between retries
     track_tool_stats=False,          # bool — per-tool call/latency/error tracking
     verbose=False,                   # bool — log governance decisions
+    telemetry=None,                  # "off" | "local" | "remote" | None (AXOR_TELEMETRY env)
 )
 ```
 
