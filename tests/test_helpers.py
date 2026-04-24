@@ -88,3 +88,50 @@ def test_build_telemetry_pipeline_off_returns_none():
 def test_build_telemetry_pipeline_invalid_mode_returns_none():
     from axor_langchain.middleware import _build_telemetry_pipeline
     assert _build_telemetry_pipeline(mode="garbage", axor_version="") is None
+
+
+def test_missing_telemetry_warning_fires_once(capsys, monkeypatch):
+    """When mode!=off and axor-telemetry is unimportable, a one-time stderr
+    hint tells the user exactly how to fix it."""
+    from axor_langchain import middleware as mw_mod
+
+    # Block the import of axor_telemetry.
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **kw):
+        if name == "axor_telemetry" or name.startswith("axor_telemetry."):
+            raise ImportError("simulated absence")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(mw_mod, "_missing_telemetry_warned", False, raising=False)
+    monkeypatch.delenv("AXOR_NO_BANNER", raising=False)
+
+    result1 = mw_mod._build_telemetry_pipeline(mode="local", axor_version="0.3.1")
+    result2 = mw_mod._build_telemetry_pipeline(mode="remote", axor_version="0.3.1")
+    assert result1 is None
+    assert result2 is None
+
+    captured = capsys.readouterr()
+    # First call warns; second is silent (once-per-process)
+    assert captured.err.count("axor: telemetry=") == 1
+    assert "pip install axor-langchain[telemetry]" in captured.err
+
+
+def test_missing_telemetry_warning_suppressed_by_env(capsys, monkeypatch):
+    from axor_langchain import middleware as mw_mod
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **kw):
+        if name == "axor_telemetry" or name.startswith("axor_telemetry."):
+            raise ImportError("simulated absence")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(mw_mod, "_missing_telemetry_warned", False, raising=False)
+    monkeypatch.setenv("AXOR_NO_BANNER", "1")
+
+    mw_mod._build_telemetry_pipeline(mode="local", axor_version="0.3.1")
+    assert capsys.readouterr().err == ""

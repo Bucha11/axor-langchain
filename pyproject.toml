@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "axor-langchain"
-version = "0.3.0"
+version = "0.3.1"
 description = "Governance middleware for LangChain 1.0 agents — powered by axor-core compression engines"
 readme = "README.md"
 license = { text = "MIT" }

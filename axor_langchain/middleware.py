@@ -55,16 +55,40 @@ def _resolve_telemetry_mode(kwarg_value: str | None) -> str:
     return "off"
 
 
+_missing_telemetry_warned = False
+
+
+def _warn_missing_telemetry(mode: str) -> None:
+    """
+    Print a single-line stderr hint when a non-off telemetry mode is
+    requested but axor-telemetry is not importable. Shown at most once
+    per process — repeated AxorMiddleware constructions stay quiet.
+    """
+    global _missing_telemetry_warned
+    if _missing_telemetry_warned or os.environ.get("AXOR_NO_BANNER") == "1":
+        return
+    sys.stderr.write(
+        f"axor: telemetry={mode!r} requested but axor-telemetry is not installed. "
+        "Install with: pip install axor-langchain[telemetry] "
+        "(or set AXOR_NO_BANNER=1 to silence)\n"
+    )
+    _missing_telemetry_warned = True
+
+
 def _build_telemetry_pipeline(mode: str, axor_version: str) -> Any | None:
     """
     Construct a pipeline for the given resolved mode string. Returns None
     when axor-telemetry is not installed or mode is 'off'. Never raises.
+
+    When the caller asked for a non-off mode but the package is missing,
+    emit a one-time stderr hint so the intent isn't silently dropped.
     """
     if mode == "off":
         return None
     try:
         from axor_telemetry import TelemetryConfig, TelemetryMode, build_pipeline
     except ImportError:
+        _warn_missing_telemetry(mode)
         return None
     try:
         tmode = TelemetryMode(mode)
