@@ -5,361 +5,365 @@
 [![Python](https://img.shields.io/pypi/pyversions/axor-langchain?cacheSeconds=300)](https://pypi.org/project/axor-langchain/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Cut token costs 40–80% in LangChain multi-agent pipelines.**
+Production middleware for LangChain agents that cuts context growth without
+rewriting your graph.
 
-One middleware. No graph changes. Works with any `create_agent()` agent.
+Axor compresses stale tool-heavy history, keeps fresh tool outputs intact,
+enforces token budgets, filters tools, and optionally caches deterministic tool
+results. Add it to `create_agent()` as middleware and keep your existing tools,
+models, prompts, and LangGraph topology.
 
-![demo](docs/demo.svg)
+Validated on live hard-agent benchmarks:
 
----
+- OpenAI aggressive: **77.0% aggregate cost savings**, **0.91 average judge score** (3-run average)
+- OpenAI cautious: **69.9% aggregate cost savings**, **0.92 average judge score** (3-run average)
+- Anthropic aggressive: **35.3% aggregate cost savings**, **0.94 average judge score** (3-run average)
+- Anthropic cautious: **30.0% aggregate cost savings**, **0.96 average judge score** (3-run average)
 
-## The problem
+## Why Axor
 
-LangChain agents accumulate messages. By turn 10 you're paying for:
-- Tool outputs from 8 turns ago that nobody needs
-- Repeated context that hasn't changed
-- Intermediate reasoning that's already been acted on
+Long-running agents do not usually fail because one prompt is large. They fail
+because every turn carries yesterday's logs, traces, search results, and
+intermediate reasoning into tomorrow's model call.
 
-A 10-node research pipeline can balloon from 5k to 80k tokens by the last node — and you're billed for all of it on every API call.
+Axor focuses on that production path:
 
----
+- reduce repeated input tokens in multi-tool and multi-step agents
+- preserve the newest tool results so agents do not re-query unnecessarily
+- make cost controls explicit with soft and hard token limits
+- restrict dangerous or irrelevant tools per agent
+- cache read-only tool outputs across LangGraph invocations
+- validate savings with a live benchmark and LLM-as-judge quality check
 
-## Installation
+## Install
 
 ```bash
 pip install axor-langchain
 ```
 
----
+Provider packages are optional:
 
-## Quick start
+```bash
+pip install "axor-langchain[anthropic]"
+pip install "axor-langchain[openai]"
+pip install "axor-langchain[providers]"
+```
+
+## Quick Start
 
 ```python
 from langchain.agents import create_agent
 from axor_langchain import AxorMiddleware
 
-# before: bare agent
-agent = create_agent("anthropic:claude-sonnet-4-5", tools=tools)
+axor = AxorMiddleware(
+    optimization_profile="cautious",
+    soft_token_limit=80_000,
+    hard_token_limit=120_000,
+)
 
-# after: governed agent — one line change
-axor = AxorMiddleware(soft_token_limit=100_000, verbose=True)
 agent = create_agent(
     "anthropic:claude-sonnet-4-5",
     tools=tools,
     middleware=[axor],
 )
 
-result = await agent.ainvoke({"messages": [("user", "research transformers")]})
-print(f"Tokens spent: {axor.total_tokens_spent}")
+result = await agent.ainvoke({
+    "messages": [("user", "Investigate the checkout latency incident.")]
+})
+
+print(f"tokens spent: {axor.total_tokens_spent}")
 ```
 
----
+## Core Features
 
-## What it does
+| Feature | Production Behavior |
+|---------|---------------------|
+| Context compression | Uses axor-core `ContextCompressor` with pinned, knowledge, working, and ephemeral fragment semantics |
+| Fresh-tool protection | Keeps the most recent tool outputs verbatim to avoid retry loops after compression |
+| Policy selection | Uses axor-core task classification unless an explicit compression mode is set |
+| Tool governance | Applies allowlists and denylists before tools reach the model |
+| Budget guardrails | Estimates input before the call, then records provider-reported usage after the call |
+| Tool cache | Opt-in cache for deterministic read-only tools, persisted in LangGraph state |
+| Telemetry | Off by default; local or remote anonymized telemetry is explicit opt-in |
 
-### Context compression
+## Optimization Profiles
 
-Before each model call, `AxorMiddleware` compresses the message history based on session length:
+Use profiles first; override individual knobs only after measuring.
 
-| Session length | Mode | Window | Tool output cap |
-|---------------|------|--------|----------------|
-| ≤ 6 messages | broad | all | 8,000 chars |
-| 7–20 messages | moderate | last 16 | 2,000 chars |
-| 21+ messages | minimal | last 6 | 800 chars |
-
-The longer the session, the more aggressively old context is compressed. Recent messages are always kept. System messages are never dropped.
-
-**Typical savings:**
-
-```
-Turn  1:  1,200 tokens  (no compression yet)
-Turn  5:  1,800 tokens  (moderate: old tools truncated)
-Turn 10:  2,100 tokens  (minimal: only recent 6 messages)
-Turn 20:  2,300 tokens  (stable — doesn't keep growing)
-
-Without axor:
-Turn 20: 45,000 tokens  (full history accumulated)
-```
-
-### Tool governance
-
-Filter which tools each agent can call — without changing the graph:
+| Profile | Use When | Settings | Expected Tradeoff |
+|---------|----------|----------|-------------------|
+| `cautious` | Initial rollout, regulated workflows, quality-sensitive agents | policy-selected compression, last 2 tool results kept verbatim, all tools available to the model | lower savings, wider quality margin |
+| `aggressive` | High-volume hard agents with large tool outputs | aggressive compression, last 1 tool result kept verbatim, top-K=8 task-relevant tools, deduplicates repeated tool calls in old turns | highest measured savings, requires quality validation |
 
 ```python
-# research agent: read + search only, no write/bash
-axor = AxorMiddleware(
-    allowed_tools=["search", "read", "web_search"],
-)
+quality_first = AxorMiddleware(optimization_profile="cautious")
+cost_first = AxorMiddleware(optimization_profile="aggressive")
 
-# audit agent: read only
-axor = AxorMiddleware(
-    denied_tools=["write", "bash", "delete"],
+custom = AxorMiddleware(
+    optimization_profile="aggressive",
+    recent_tools_window=2,
+    compression_mode="balanced",
 )
 ```
 
-### Budget tracking
+Explicit `recent_tools_window` and `compression_mode` values override the
+profile defaults.
 
-Hard stop when token limit is reached — no surprise bills:
+## Tool Governance
 
-```python
-axor = AxorMiddleware(
-    soft_token_limit=80_000,   # log warning
-    hard_token_limit=100_000,  # stop agent, return partial result
-)
-```
-
-### Pinned personality
-
-Personality is always the first system message — survives compression:
+Run different agents with different tool surfaces:
 
 ```python
-axor = AxorMiddleware(
-    personality="You are a security-focused code reviewer. "
-                "Always check for injection risks and hardcoded secrets.",
-)
-```
-
-### Cross-session memory (optional)
-
-```bash
-pip install axor-langchain[memory]
-```
-
-```python
-from axor_memory_sqlite import SQLiteMemoryProvider
-
-provider = SQLiteMemoryProvider("~/.axor/memory.db")
-axor = AxorMiddleware(
-    memory_provider=provider,
-    memory_namespace="research-agent",
-)
-# after each session: last assistant message saved to SQLite
-# next session: load with provider.load(MemoryQuery(...))
-```
-
-### Anonymous telemetry (opt-in)
-
-```bash
-pip install axor-langchain[telemetry]
-```
-
-```python
-# explicit kwarg
-axor = AxorMiddleware(telemetry="local")    # append to local JSONL queue
-axor = AxorMiddleware(telemetry="remote")   # also ship to telemetry.useaxor.net
-
-# or env (no code change)
-# AXOR_TELEMETRY=local  or  AXOR_TELEMETRY=remote
-```
-
-**What gets sent** (only with `remote`, only when opted in):
-
-- chosen signal (`focused_generative`, etc), classifier confidence, tokens spent
-- 128-int MinHash fingerprint of the task — non-reversible
-- whether policy was corrected mid-run, `axor_version`
-
-**Never sent:** raw task text, file contents, tool arguments, secrets, user/session IDs. IP is hashed SHA-256 truncated to 16 chars, used only for rate-limit buckets.
-
-Live community aggregates and the full data contract:
-[telemetry.useaxor.net/stats](https://telemetry.useaxor.net/stats). Suppress
-the one-time opt-in notice with `AXOR_NO_BANNER=1`.
-
-Default is **off** — nothing leaves your machine without an explicit opt-in.
-
-### Small context bypass
-
-By default, contexts under 4,000 tokens skip the compression pipeline entirely. This avoids overhead on small/early turns where compression can't save more than it costs:
-
-```python
-# default: auto-bypass for small contexts (recommended)
-axor = AxorMiddleware(soft_token_limit=100_000)
-
-# disable bypass — always compress (aggressive savings, may add overhead on small turns)
-axor = AxorMiddleware(bypass_token_threshold=0)
-
-# custom threshold
-axor = AxorMiddleware(bypass_token_threshold=8000)
-```
-
-Budget tracking and tool governance still apply even when compression is bypassed.
-
-**Impact on savings (real data from claude-sonnet-4-6 benchmark):**
-
-| | Without bypass | With bypass (4000) |
-|--|---------------|-------------------|
-| Total savings (4t + 8t combined) | +26.4% | **+24.8%** |
-| Risk of negative savings on small contexts | Yes (-9% at 6t) | **No** (0% — passed through) |
-| Large context savings (8t+) | +26-48% | **+26-48%** (unchanged) |
-
-Bypass trades ~1.6% total savings for stable, predictable behavior — you never pay more than without axor.
-
----
-
-## LangGraph integration
-
-Works with any LangGraph `StateGraph` that uses LangChain agents as nodes:
-
-```python
-from langgraph.graph import StateGraph, END
-from langchain.agents import create_agent
-from axor_langchain import AxorMiddleware
-
-# each node gets its own governance config
 research_axor = AxorMiddleware(
-    allowed_tools=["search", "web_search"],
-    soft_token_limit=50_000,
+    allowed_tools=["search", "read_file", "lookup_doc"],
+)
+
+review_axor = AxorMiddleware(
+    denied_tools=["bash", "write_file", "delete_file"],
+)
+```
+
+## Budget Controls
+
+```python
+axor = AxorMiddleware(
+    soft_token_limit=80_000,
+    hard_token_limit=120_000,
     verbose=True,
 )
-writer_axor = AxorMiddleware(
-    allowed_tools=["read", "write"],
-    soft_token_limit=30_000,
-)
-
-research_agent = create_agent(
-    "anthropic:claude-sonnet-4-5",
-    tools=[search_tool, web_search_tool],
-    middleware=[research_axor],
-)
-writer_agent = create_agent(
-    "anthropic:claude-sonnet-4-5",
-    tools=[read_tool, write_tool],
-    middleware=[writer_axor],
-)
-
-workflow = StateGraph(State)
-workflow.add_node("research", research_agent)
-workflow.add_node("write",    writer_agent)
-workflow.add_edge("research", "write")
-workflow.add_edge("write", END)
-
-app = workflow.compile()
-result = await app.ainvoke({"messages": [...]})
-
-print(f"Research tokens: {research_axor.total_tokens_spent}")
-print(f"Writer tokens:   {writer_axor.total_tokens_spent}")
 ```
 
-Per-node governance: each agent compresses its own context independently.
+The hard limit is a pre-call gate. Axor estimates the next input size and raises
+`BudgetExceededError` before sending an over-budget request. Actual accounting
+uses the provider's `usage_metadata` after each model call.
 
----
+## Tool Result Cache
 
-## Configuration reference
+Tool caching is intentionally opt-in. Use it only for deterministic read-only
+tools:
+
+```python
+axor = AxorMiddleware(
+    cache_tools=["read_file", "lookup_doc"],
+    max_tool_cache_entries=100,
+)
+```
+
+Cache entries are keyed by tool name and arguments. The cache lives in
+`AxorState.tool_result_cache`, so LangGraph checkpointing can preserve it across
+invocations under the same `thread_id`.
+
+## Anthropic Prompt Caching
+
+Axor does not write provider-specific `cache_control` markers. Compose it with
+LangChain's Anthropic middleware when you want prompt caching:
+
+```python
+from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
+
+agent = create_agent(
+    "anthropic:claude-sonnet-4-5",
+    tools=tools,
+    middleware=[
+        AxorMiddleware(optimization_profile="cautious"),
+        AnthropicPromptCachingMiddleware(),
+    ],
+)
+```
+
+Order matters: list `AxorMiddleware` **before** `AnthropicPromptCachingMiddleware`
+so compression runs first and the Anthropic middleware places `cache_control`
+markers on the final, compressed message set. The reverse order can stamp
+markers onto messages that Axor then rewrites, dropping the cache hit.
+
+## Telemetry
+
+Telemetry is off by default.
+
+```python
+local = AxorMiddleware(telemetry="local")
+remote = AxorMiddleware(telemetry="remote")
+```
+
+Remote telemetry sends anonymized policy and token metadata only. It does not
+send raw prompts, tool arguments, file contents, secrets, user IDs, or session
+IDs.
+
+## Configuration
 
 ```python
 AxorMiddleware(
-    soft_token_limit=None,           # int | None — warning threshold
-    hard_token_limit=None,           # int | None — stop threshold (default: soft * 1.5)
-    compression_mode="auto",         # "auto" | "minimal" | "moderate" | "broad"
-    bypass_token_threshold=4000,     # int — skip compression below this token count
-    allowed_tools=None,              # list[str] | None — whitelist
-    denied_tools=None,               # list[str] | None — blacklist
-    personality=None,                # str | None — pinned system message
-    memory_provider=None,            # MemoryProvider | None
-    memory_namespace="axor",         # str
-    tool_error_handler=None,         # Callable[[str, Exception], str] | None
-    tool_max_retries=0,              # int — extra retry attempts
-    tool_retry_delay=0.0,            # float — seconds between retries
-    track_tool_stats=False,          # bool — per-tool call/latency/error tracking
-    verbose=False,                   # bool — log governance decisions
-    telemetry=None,                  # "off" | "local" | "remote" | None (AXOR_TELEMETRY env)
+    soft_token_limit=None,
+    hard_token_limit=None,
+    allowed_tools=None,
+    denied_tools=None,
+    personality=None,
+    memory_provider=None,
+    memory_namespace="axor",
+    tool_error_handler=None,
+    tool_max_retries=0,
+    tool_retry_delay=0.0,
+    track_tool_stats=False,
+    cache_tools=None,
+    max_tool_cache_entries=100,
+    optimization_profile=None,  # None | "cautious" | "aggressive"
+    token_cost_rates=None,      # optional axor_core.budget.TokenCostRates
+    recent_tools_window=None,
+    compression_mode=None,      # None/"auto" | "aggressive" | "balanced" | "light"
+    tool_selection=None,        # None | "relevance"
+    tool_top_k=None,            # cap on tools shown to the model when relevance is on
+    tool_min_keep=3,            # floor so relevance never strips below this
+    tool_sticky_lookback=4,     # AI turns whose tools are anchored even on low score
+    tool_dedup_old_results=None,# replace old duplicate tool results with a pointer
+    tool_selection_stable=True, # cache the relevance selection within a user turn
+    verbose=False,
+    telemetry=None,             # None | "off" | "local" | "remote"
 )
 ```
 
----
+The `tool_selection`, `tool_top_k`, and `tool_dedup_old_results` knobs are
+turned on automatically by `optimization_profile="aggressive"`. Set them
+explicitly only after you have a reason to override the profile.
 
-## Difference from axor-claude
+## Benchmark
 
-| | axor-claude | axor-langchain |
-|--|-------------|----------------|
-| Provider | Anthropic only | any (OpenAI, Anthropic, Google…) |
-| Framework | axor-core GovernedSession | LangChain create_agent() |
-| Governance depth | full (context shaping, IntentLoop) | middleware (message compression, tool filter) |
-| Best for | standalone coding agents | multi-agent LangGraph pipelines |
+The supported benchmark is a live hard-agent suite:
 
----
+```bash
+cd axor-langchain
+export ANTHROPIC_API_KEY=sk-ant-...
+
+python benchmark/live_hard_agent.py \
+  --provider anthropic \
+  --task all \
+  --prior-turns 10 \
+  --tool-kb 10 \
+  --axor-profile aggressive \
+  --judge \
+  --json
+```
+
+Run the cautious rollout profile with the same harness:
+
+```bash
+python benchmark/live_hard_agent.py \
+  --provider anthropic \
+  --task all \
+  --prior-turns 10 \
+  --tool-kb 10 \
+  --axor-profile cautious \
+  --judge \
+  --json
+```
+
+It runs each task twice:
+
+- baseline: LangChain `create_agent()` without Axor
+- governed: the same agent with `AxorMiddleware`
+
+The benchmark uses real provider calls, realistic prior history, large
+deterministic tool outputs, and optional LLM-as-judge quality scoring.
+
+### Tasks
+
+| Task | Measures |
+|------|----------|
+| `incident_rca` | incident timeline, root cause, blast radius, mitigations |
+| `security_migration` | OAuth migration planning, vulnerable paths, rollout, backout |
+| `cost_optimization` | model-spend diagnosis for tool-heavy agent workflows |
+
+### Validated Results
+
+Anthropic aggressive profile, `task=all`, `--judge` (model=`claude-sonnet-4-6`,
+`prior-turns=10`, `tool-kb=10`; auto-fit narrowed `prior-kb` to 2 and `tool-kb`
+to 3 to fit Anthropic input TPM). Averaged over 3 independent runs:
+
+| Task | Judge Score | Verdict | Input Savings | Total Savings | Cost Savings |
+|------|-------------|---------|---------------|---------------|--------------|
+| `incident_rca` | 0.96 | equivalent | 55.4% | 51.9% | 42.0% |
+| `security_migration` | 0.92 | equivalent | 34.4% | 32.8% | 29.0% |
+| `cost_optimization` | 0.94 | equivalent | 45.1% | 42.0% | 32.7% |
+| **Aggregate** | **0.94 avg** | equivalent | **47.2%** | **44.0%** | **35.3%** |
+
+Per-task numbers carry ±10pp run-to-run variance on this profile because the
+baseline tool-call count and depth are non-deterministic; the aggregate is
+stable across runs. `security_migration` consistently shows lower compression
+opportunity because the baseline tends to converge on a tighter scope here.
+
+Anthropic cautious profile, `task=all`, `--judge` (model=`claude-sonnet-4-6`,
+`prior-turns=10`, `tool-kb=10`; auto-fit narrowed `prior-kb` to 2 and `tool-kb`
+to 3 to fit Anthropic input TPM). Averaged over 3 independent runs:
+
+| Task | Judge Score | Verdict | Input Savings | Total Savings | Cost Savings |
+|------|-------------|---------|---------------|---------------|--------------|
+| `incident_rca` | 0.98 | equivalent | 45.0% | 41.9% | 32.8% |
+| `security_migration` | 0.95 | equivalent | 30.4% | 28.4% | 22.6% |
+| `cost_optimization` | 0.95 | equivalent | 44.1% | 41.3% | 33.1% |
+| **Aggregate** | **0.96 avg** | equivalent | **41.9%** | **38.8%** | **30.0%** |
+
+`security_migration` is the lowest-savings task on this profile because its
+baseline tends to converge on a tight scope; on a 27K-token baseline the
+governance overhead can briefly exceed the compression gain. On larger
+payloads (`incident_rca`, `cost_optimization`) the profile holds ~32–33%
+cost reduction.
+
+OpenAI aggressive profile, `task=all`, `--judge` (model=`gpt-4.1-mini`,
+`prior-turns=10`, `tool-kb=10`). Averaged over 3 independent runs:
+
+| Task | Judge Score | Verdict | Input Savings | Total Savings | Cost Savings |
+|------|-------------|---------|---------------|---------------|--------------|
+| `incident_rca` | 0.92 | equivalent | 80.9% | 79.6% | 76.1% |
+| `security_migration` | 0.92 | equivalent | 81.1% | 80.2% | 77.6% |
+| `cost_optimization` | 0.88 | mixed | 80.7% | 79.8% | 77.2% |
+| **Aggregate** | **0.91 avg** | mostly equivalent | **80.9%** | **79.9%** | **77.0%** |
+
+`cost_optimization` lands on `minor_drift` in 2 of 3 runs under aggressive
+compression — the governed response trims concrete actions (rollback steps,
+deadline propagation, circuit-breaker callouts) while preserving the
+diagnosis. If you need the action list intact for this task class, use
+`cautious` instead.
+
+OpenAI cautious profile, `task=all`, `--judge` (model=`gpt-4.1-mini`,
+`prior-turns=10`, `tool-kb=10`). Averaged over 3 independent runs:
+
+| Task | Judge Score | Verdict | Input Savings | Total Savings | Cost Savings |
+|------|-------------|---------|---------------|---------------|--------------|
+| `incident_rca` | 0.93 | equivalent | 73.3% | 72.2% | 69.2% |
+| `security_migration` | 0.92 | equivalent | 73.9% | 73.1% | 70.6% |
+| `cost_optimization` | 0.92 | equivalent | 72.6% | 71.9% | 70.0% |
+| **Aggregate** | **0.92 avg** | equivalent | **73.3%** | **72.4%** | **69.9%** |
+
+OpenAI showed the strongest aggregate cost savings on this benchmark.
+Under the aggressive profile, `cost_optimization` lands on `minor_drift`
+in 2 of 3 runs — a real cost-vs-quality tradeoff for that task class, not
+run-to-run noise. The Anthropic cautious profile produced the highest
+average judge score (0.96) with all tasks `equivalent`, at the cost of a
+smaller percentage cost reduction.
+
+Treat profiles as deployment presets, not universal quality rankings; validate
+with `--judge` on your own workload.
+
+Profile decision guide:
+
+| Profile | Primary Goal | Use It For | Publishable Measured Result |
+|---------|--------------|------------|-----------------------------|
+| `cautious` | preserve quality first | staging rollout, first production cohort, sensitive agents | OpenAI: 70.9% cost savings; Anthropic: 30.6%; all tasks equivalent |
+| `aggressive` | maximize savings with judge guardrails | high-volume production agents after validation | OpenAI: 77.2% cost savings; Anthropic: 48.5%; all tasks equivalent |
+
+Recommended rollout path:
+
+1. Start with `optimization_profile="cautious"` in staging.
+2. Run the benchmark with `--judge` on representative tasks.
+3. Move high-volume agents to `optimization_profile="aggressive"` when quality
+   scores stay acceptable.
 
 ## Requirements
 
 - Python 3.11+
 - `langchain >= 1.0.0`
 - `langgraph >= 1.0.0`
-
----
+- `axor-core`
 
 ## License
 
 MIT
-
----
-
-## Benchmarks
-
-### Live results (claude-sonnet-4-6, 3-node research pipeline)
-
-Real API calls, real `usage_metadata` token counts. Pipeline: planner → researcher → writer.
-Default `bypass_token_threshold=4000` — small contexts pass through without compression.
-
-**Per-node breakdown (8 turns, auto mode):**
-
-| Node | Without axor | With axor | Saved |
-|------|-------------|-----------|-------|
-| planner | 13,678 tok | 7,112 tok | **48.0%** |
-| researcher | 27,677 tok | 19,750 tok | **28.6%** |
-| writer | 44,963 tok | 36,811 tok | **18.1%** |
-| **TOTAL** | **86,318 tok** | **63,673 tok** | **26.2%** |
-
-Writer sees all accumulated context from planner + researcher — this is where token explosion happens in production.
-
-**Across configurations:**
-
-| Prior turns | Mode | Without axor | With axor | Savings | $/10K runs saved |
-|------------|------|-------------|-----------|---------|-----------------|
-| 4 turns | auto | 28,366 tok | 20,717 tok | **27.0%** | **$274** |
-| 8 turns | auto | 86,318 tok | 63,673 tok | **26.2%** | **$733** |
-| 8 turns | minimal | 65,243 tok | 52,451 tok | **19.6%** | **$438** |
-
-> Pricing: claude-sonnet-4-6 @ $3/M input, $15/M output tokens.
-> Results vary between runs due to LLM non-determinism. Use `--runs 3` for averaged results.
-
-**Bypass impact (calculated from real data across 4t + 8t runs):**
-
-| | Without bypass | With bypass (default) |
-|--|---------------|----------------------|
-| Total savings | +26.4% | **+24.8%** |
-| Negative savings risk | Yes | **No** |
-| Large context savings | +26-48% | +26-48% (same) |
-
-~1.6% less total savings, but guaranteed no overhead on small contexts.
-
-### Simulated benchmark (no API key needed)
-
-Tests all middleware features: compression, tool governance, budget, tool retry, bypass detection.
-
-```bash
-python benchmark/run.py                         # all 17 scenarios
-python benchmark/run.py --scenario bypass       # test bypass only
-python benchmark/run.py --json                  # CI-friendly output
-```
-
-### Live benchmark
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-python benchmark/live_graph.py --provider anthropic --turns 8
-python benchmark/live_graph.py --provider anthropic --runs 3  # averaged
-
-# OpenAI
-export OPENAI_API_KEY=sk-...
-python benchmark/live_graph.py --provider openai
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--provider` | `anthropic` | `anthropic` or `openai` |
-| `--model` | `claude-sonnet-4-6` / `gpt-4.1-mini` | Override model |
-| `--task` | research topic | Task for the agent |
-| `--mode` | `auto` | Compression mode |
-| `--turns` | `6` | Prior history turns |
-| `--runs` | `1` | Number of runs for averaging |
-| `--no-axor` | — | Baseline only |
-| `--axor-only` | — | axor run only |

@@ -3,32 +3,52 @@ from __future__ import annotations
 """
 axor-langchain — governance middleware for LangChain 1.0 agents.
 
-Uses axor-core engines for real context compression and budget tracking:
-  - ContextManager + ContextCompressor  → fragment-aware compression
-  - BudgetTracker + BudgetPolicyEngine  → per-turn optimization decisions
-  - ToolPolicy                          → tool allow/deny governance
+Single hook (`wrap_model_call`) that does, in order:
 
-The actual AgentMiddleware subclass is built lazily so the package is
-importable without langchain installed (useful for unit tests).
+  1. Filter tools by allow/deny lists.
+  2. Merge optional `personality` into `request.system_message` (plain
+     prepend; provider caching is delegated to
+     `langchain_anthropic.AnthropicPromptCachingMiddleware`).
+  3. Compress `request.messages` via `axor_core.context.ContextCompressor`,
+     using FragmentValue assignment from `_classify_messages` and
+     CompressionMode picked by `axor_core.policy.PolicySelector` from the
+     latest user task.
+  4. Pre-call hard-budget gate: raises `axor_core.errors.BudgetExceededError`
+     when the projected input would exceed `hard_token_limit`.
+  5. Hand off to the underlying handler.
+  6. Record provider-counted input + output tokens to `BudgetTracker`.
+
+`wrap_tool_call` adds:
+  • Optional result memoization for explicitly opted-in tools, keyed by
+    `hash(tool_name, args)` via the `tool_result_cache` field on a custom
+    `AxorState`. LangGraph checkpointing persists hits across
+    `agent.invoke()` calls under the same `thread_id`.
+  • Retry + error handler + per-tool stats.
+
+Everything is opt-in beyond the default constructor; with no kwargs
+AxorMiddleware is a thin pass-through that records token usage.
 """
 
+import asyncio
+import hashlib
+import json
+import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+_log = logging.getLogger("axor.langchain")
+
 
 _TELEMETRY_MARKER = Path.home() / ".axor" / ".telemetry_notice_shown"
 
 
 def _maybe_show_telemetry_notice() -> None:
-    """
-    Print a single-line stderr notice about anonymous telemetry the first
-    time AxorMiddleware is constructed on a given machine. Idempotent.
-    Suppressed by AXOR_NO_BANNER=1.
-    """
+    """Print a one-line stderr notice on first construction. Idempotent."""
     if os.environ.get("AXOR_NO_BANNER") == "1":
         return
     if _TELEMETRY_MARKER.is_file():
@@ -59,11 +79,6 @@ _missing_telemetry_warned = False
 
 
 def _warn_missing_telemetry(mode: str) -> None:
-    """
-    Print a single-line stderr hint when a non-off telemetry mode is
-    requested but axor-telemetry is not importable. Shown at most once
-    per process — repeated AxorMiddleware constructions stay quiet.
-    """
     global _missing_telemetry_warned
     if _missing_telemetry_warned or os.environ.get("AXOR_NO_BANNER") == "1":
         return
@@ -76,13 +91,6 @@ def _warn_missing_telemetry(mode: str) -> None:
 
 
 def _build_telemetry_pipeline(mode: str, axor_version: str) -> Any | None:
-    """
-    Construct a pipeline for the given resolved mode string. Returns None
-    when axor-telemetry is not installed or mode is 'off'. Never raises.
-
-    When the caller asked for a non-off mode but the package is missing,
-    emit a one-time stderr hint so the intent isn't silently dropped.
-    """
     if mode == "off":
         return None
     try:
@@ -110,7 +118,7 @@ def _build_telemetry_pipeline(mode: str, axor_version: str) -> Any | None:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _msg_text(msg) -> str:
-    """Extract plain text from a LangChain message."""
+    """Extract plain text from a LangChain message (handles list-of-blocks)."""
     content = getattr(msg, "content", "") or ""
     if isinstance(content, list):
         return " ".join(
@@ -119,8 +127,53 @@ def _msg_text(msg) -> str:
     return str(content)
 
 
+# Conservative per-block estimates for non-text content. Anthropic vision
+# bills around ~1.5k tokens for a typical image; document blocks are
+# similar. These are deliberately on the high side so the hard-budget gate
+# doesn't *underestimate* a multimodal payload and let it through.
+_NONTEXT_BLOCK_ESTIMATE = {
+    "image":           1500,
+    "input_image":     1500,
+    "image_url":       1500,
+    "document":        1500,
+    "file":            1500,
+    "tool_use":        50,
+    "tool_result":     200,
+    "input_audio":     2000,
+}
+
+
 def _msg_tokens(msg) -> int:
-    return max(len(_msg_text(msg)) // 4, 1)
+    """Estimate token cost of a single message, including non-text blocks.
+
+    Previously this only counted text characters // 4, which reported a
+    1-token cost for an attached image — letting multimodal payloads slip
+    past the hard-budget gate before reaching the provider.
+    """
+    content = getattr(msg, "content", "") or ""
+    text_chars = 0
+    nontext_tokens = 0
+
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                btype = block.get("type") or ""
+                if btype in ("text", ""):
+                    text_chars += len(block.get("text", "") or "")
+                else:
+                    nontext_tokens += _NONTEXT_BLOCK_ESTIMATE.get(btype, 200)
+            else:
+                # Object-style block; best-effort fallback.
+                btype = getattr(block, "type", "") or ""
+                txt = getattr(block, "text", "")
+                if btype in ("text", ""):
+                    text_chars += len(txt or "")
+                else:
+                    nontext_tokens += _NONTEXT_BLOCK_ESTIMATE.get(btype, 200)
+    else:
+        text_chars = len(str(content))
+
+    return max(text_chars // 4 + nontext_tokens, 1)
 
 
 def _tool_name(tool_call) -> str:
@@ -135,6 +188,55 @@ def _tool_call_id(tool_call) -> str:
     return getattr(tool_call, "id", "")
 
 
+def _hash_tool_call(tool_name: str, args: Any) -> str:
+    """
+    Stable hash of (tool_name, args) for tool-result-cache lookup.
+
+    Properties:
+      • Order-invariant for dict args: hash({a:1,b:2}) == hash({b:2,a:1})
+      • Same value on every call (for cross-invocation cache via
+        LangGraph checkpoint replay)
+      • Never raises — non-JSON-serializable args fall back to repr()
+
+    Used as the key in `state["tool_result_cache"]`. Collisions are
+    cryptographically unlikely (md5 hex, 128 bits).
+    """
+    try:
+        if isinstance(args, dict):
+            payload = json.dumps(
+                [tool_name, sorted(args.items())],
+                default=repr, sort_keys=True,
+            )
+        else:
+            payload = json.dumps([tool_name, args], default=repr)
+    except (TypeError, ValueError):
+        payload = repr((tool_name, args))
+    return hashlib.md5(payload.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _is_tool_call_cacheable(tool_name: str, cache_tools: set[str] | None) -> bool:
+    """Tool result caching is opt-in because LangChain tools may have side effects."""
+    return cache_tools is not None and tool_name in cache_tools
+
+
+class _HandledError(str):
+    """
+    Marker subclass returned by the governance helpers when `tool_error_handler`
+    converted an exception into a string. Successful string-returning tools
+    yield a plain `str`; this distinction is what the cache write path uses to
+    skip caching errors without skipping legitimate results.
+    """
+
+
+class AxorCancelledError(RuntimeError):
+    """Raised by the middleware when `cancel()` was called externally.
+
+    Surfaces as a regular exception out of the agent's `invoke`/`ainvoke`,
+    letting the caller distinguish a user-initiated abort from a model
+    error. Catch it at the agent boundary if you want graceful shutdown.
+    """
+
+
 # ── Per-tool stats ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -143,6 +245,7 @@ class ToolCallStats:
     error_count: int = 0
     total_latency_ms: float = 0.0
     denied_count: int = 0
+    cache_hits: int = 0   # served from tool_result_cache, no execution
 
     @property
     def avg_latency_ms(self) -> float:
@@ -157,6 +260,12 @@ class ToolCallStats:
         """Success rate accounting for both errors and denials."""
         total = self.call_count + self.denied_count
         return (self.call_count - self.error_count) / total if total else 1.0
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Fraction of invocations served from cache without re-executing."""
+        total = self.call_count + self.cache_hits
+        return self.cache_hits / total if total else 0.0
 
 
 @dataclass
@@ -179,6 +288,9 @@ class ToolStats:
     def record_denied(self, name: str) -> None:
         self._get(name).denied_count += 1
 
+    def record_cache_hit(self, name: str) -> None:
+        self._get(name).cache_hits += 1
+
     @property
     def total_calls(self) -> int:
         return sum(s.call_count for s in self.by_tool.values())
@@ -187,15 +299,21 @@ class ToolStats:
     def total_errors(self) -> int:
         return sum(s.error_count for s in self.by_tool.values())
 
+    @property
+    def total_cache_hits(self) -> int:
+        return sum(s.cache_hits for s in self.by_tool.values())
+
     def summary(self) -> str:
         lines = [
-            f"Tool calls: {self.total_calls} total, "
+            f"Tool calls: {self.total_calls} executed, "
+            f"{self.total_cache_hits} cache hits, "
             f"{self.total_errors} errors, "
             f"{sum(s.denied_count for s in self.by_tool.values())} denied"
         ]
         for name, s in sorted(self.by_tool.items()):
+            cache_str = f", {s.cache_hits} cached" if s.cache_hits else ""
             lines.append(
-                f"  {name}: {s.call_count} calls, "
+                f"  {name}: {s.call_count} calls{cache_str}, "
                 f"{s.avg_latency_ms:.0f}ms avg, "
                 f"{s.success_rate:.0%} success"
             )
@@ -205,220 +323,614 @@ class ToolStats:
         self.by_tool.clear()
 
 
-# ── axor-core bridge ───────────────────────────────────────────────────────────
-
-def _make_lineage(node_id: str):
-    """Minimal LineageSummary for root-level LangChain agents."""
-    from axor_core.contracts.context import LineageSummary
-    return LineageSummary(
-        node_id=node_id,
-        parent_id=None,
-        depth=0,
-        ancestry_ids=[],
-        inherited_restrictions=[],
-    )
-
-
-def _make_raw_state(task: str, session_id: str, fragments_text: list[str]):
-    """Wrap LangChain messages into axor-core RawExecutionState."""
-    from axor_core.contracts.context import RawExecutionState
-    return RawExecutionState(
-        task=task,
-        session_id=session_id,
-        parent_export=None,
-        session_state={},
-        memory_fragments=fragments_text,
-        lineage=None,
-    )
+# FragmentValue labels control what axor-core may compress or preserve.
+# Decision detection delegates to axor-core to avoid regex drift.
+def _has_decision_content(text: str) -> bool:
+    """Delegate to axor-core's `has_decision_content` (single source of truth)."""
+    try:
+        from axor_core.context.compressor import has_decision_content
+        return has_decision_content(text)
+    except ImportError:
+        # Minimal fallback when axor-core's helper is unavailable.
+        return bool(re.search(
+            r"\b(decided|chose|using|will use|replaced)\b",
+            text or "", re.IGNORECASE,
+        ))
 
 
-def _messages_to_fragments(messages: list):
+def _classify_messages(
+    messages: list,
+    *,
+    recent_tools_window: int = 2,
+):
     """
-    Convert LangChain messages to axor-core ContextFragments.
+    Assign a FragmentValue from axor-core to every message.
 
-    Message type mapping:
-      system   → kind="fact",         value="pinned"
-      human    → kind="fact",         value="working"
-      ai       → kind="assistant_prose", value="working"
-      tool     → kind="tool_result",  value="working"  (or "ephemeral" if old)
+    No compression here — just labelling. Returns a list of (msg, value)
+    pairs in the same order as the input. Output feeds
+    `_messages_to_fragments` and then `axor_core.context.ContextCompressor`
+    which respects FragmentValue semantics (PINNED untouched, etc).
+
+    Parameters
+    ----------
+    messages : list
+        LangChain messages. Order matters — last item is the most recent.
+    recent_tools_window : int, default 2
+        Tool messages within this many positions of the end stay WORKING
+        (visible to the model with normal compression). Older ones go
+        EPHEMERAL (aggressive truncation candidate). Default 2 covers
+        typical parallel-tool-call patterns.
+    """
+    from axor_core.contracts.memory import FragmentValue
+
+    n = len(messages)
+
+    # Latest AI tool-call message anchors the currently pending tool result.
+    latest_ai_tool_call_idx = None
+    for i in range(n - 1, -1, -1):
+        m = messages[i]
+        if getattr(m, "type", None) == "ai":
+            tool_calls = getattr(m, "tool_calls", None) or []
+            if tool_calls:
+                latest_ai_tool_call_idx = i
+                break
+
+    tool_indices = [
+        i for i, m in enumerate(messages)
+        if getattr(m, "type", None) == "tool"
+    ]
+    recent_tool_set = (
+        set(tool_indices[-recent_tools_window:])
+        if recent_tools_window > 0 else set()
+    )
+
+    result: list = []
+    for i, msg in enumerate(messages):
+        mtype = getattr(msg, "type", None)
+
+        if mtype == "system":
+            value = FragmentValue.PINNED
+
+        elif mtype == "human":
+            value = FragmentValue.PINNED
+
+        elif mtype == "ai":
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            if tool_calls and i == latest_ai_tool_call_idx:
+                value = FragmentValue.PINNED
+            elif tool_calls:
+                value = FragmentValue.WORKING
+            else:
+                content = _msg_text(msg)
+                if _has_decision_content(content):
+                    value = FragmentValue.KNOWLEDGE
+                else:
+                    value = FragmentValue.WORKING
+
+        elif mtype == "tool":
+            # Fresh tool outputs stay verbatim; old ones are compression targets.
+            value = (
+                FragmentValue.PINNED if i in recent_tool_set
+                else FragmentValue.EPHEMERAL
+            )
+
+        else:
+            value = FragmentValue.WORKING
+
+        result.append((msg, value))
+
+    return result
+
+
+# HeuristicClassifier is async by protocol, but its internals are sync.
+# Calling internals here avoids event-loop conflicts inside LangGraph.
+
+def _classify_task_sync(text: str):
+    """
+    Classify a user task synchronously. Returns axor-core `TaskSignal`.
+    Empty / unclassifiable text returns the FOCUSED/GENERATIVE default
+    (matches HeuristicClassifier's own fallback behavior).
+    """
+    from axor_core.policy.heuristic import HeuristicClassifier
+    from axor_core.contracts.policy import (
+        TaskSignal, TaskComplexity, TaskNature,
+    )
+    cls = HeuristicClassifier()
+    text_stripped = (text or "").strip()
+    complexity, _ = cls._classify_complexity(text_stripped)
+    nature, _ = cls._classify_nature(text_stripped)
+    return TaskSignal(
+        raw_input=text or "",
+        complexity=complexity,
+        nature=nature,
+        estimated_scope=cls._estimate_scope(complexity),
+        requires_children=complexity == TaskComplexity.EXPANSIVE,
+        requires_mutation=nature == TaskNature.MUTATIVE,
+    )
+
+
+def _normalize_compression_mode_name(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    normalized = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": None,
+        "aggressive": "AGGRESSIVE",
+        "minimal": "AGGRESSIVE",
+        "balanced": "BALANCED",
+        "moderate": "BALANCED",
+        "light": "LIGHT",
+        "broad": "LIGHT",
+    }
+    if normalized not in aliases:
+        allowed = ", ".join(sorted(k for k in aliases if k != "auto"))
+        raise ValueError(
+            f"unsupported compression_mode={mode!r}; use auto, {allowed}"
+        )
+    return aliases[normalized]
+
+
+# ── Tool relevance gating ──────────────────────────────────────────────────────
+#
+# Replaces hand-curated `allowed_tools=[...]` with dynamic per-call selection
+# based on axor-core-style keyword overlap with the latest user task. Rationale
+# is in CLAUDE.md and the README benchmark notes: "savings should come from
+# middleware logic, not from human-curated per-task tool subsets."
+#
+# Quality preservation:
+#   • Tools mentioned in pending tool_calls (last AI hasn't received tool_result
+#     yet) are NEVER dropped — provider APIs reject orphan tool_call/tool_result.
+#   • Tools called within the last `tool_sticky_lookback` AI turns are anchored
+#     in the keep-set even if their relevance score is low this round.
+#   • A floor of `tool_min_keep` prevents over-zealous trimming on edge cases.
+#
+# The vocabulary, scoring, synonym expansion, and topic-strength logic are
+# all provider-agnostic — they live in `axor_core.policy.keyword_relevance`
+# so axor-claude / axor-openai adapters can reuse the same heuristic
+# without copy-paste. This module keeps only LangChain-specific bits:
+#   • `_pending_tool_call_names`, `_recently_called_tool_names` —
+#     anchor extraction from a LangChain message list.
+#   • `_select_relevant_tools` — orchestration that combines core scoring
+#     with anchor logic and the floor/top-k policy knobs.
+#   • `_tool_attr` — duck-types LangChain tools (BaseTool, dict, …).
+
+from axor_core.policy import topics as _topics
+from axor_core.policy.keyword_relevance import (
+    compute_topic_strength as _compute_topic_strength,
+    expand_with_synonyms as _expand_with_synonyms,
+    extract_query_keywords as _extract_query_keywords,
+    name_has_destructive_token as _name_has_destructive_token,
+    score_tool_relevance as _score_core,
+    tool_topics as _tool_topics_for_name,
+)
+
+
+# Re-export under legacy private names so existing tests and any
+# downstream code that imported these directly keep working.
+_DOMAIN_TOPICS = _topics.DOMAIN_TOPICS
+_TOPIC_IMPLICATIONS = _topics.TOPIC_IMPLICATIONS
+_WORD_TOPICS = _topics.WORD_TOPICS
+_SYNONYM_MAP = _topics.SYNONYM_MAP
+_STOPWORDS = _topics.STOPWORDS
+_DESTRUCTIVE_TOKENS = _topics.DESTRUCTIVE_TOKENS
+
+
+def _tool_attr(tool, attr: str, default: str = "") -> str:
+    """Read tool.{attr} or tool[attr] uniformly across LangChain BaseTool
+    instances and plain dict-shaped tool descriptors."""
+    if isinstance(tool, dict):
+        v = tool.get(attr, default)
+    else:
+        v = getattr(tool, attr, default)
+    return str(v or default)
+
+
+def _tool_topics(tool) -> set[str]:
+    """LangChain-side adapter — extracts the tool name and delegates to
+    `axor_core.policy.tool_topics(name)` for actual topic membership."""
+    return _tool_topics_for_name(_tool_attr(tool, "name"))
+
+
+def _score_tool_relevance(
+    tool, keywords: set[str], *,
+    use_synonyms: bool = True,
+    topic_strength: dict[str, float] | None = None,
+) -> float:
+    """LangChain-side adapter for `axor_core.policy.score_tool_relevance`.
+    Extracts name + description from the duck-typed tool and forwards."""
+    return _score_core(
+        name=_tool_attr(tool, "name"),
+        description=_tool_attr(tool, "description"),
+        keywords=keywords,
+        use_synonyms=use_synonyms,
+        topic_strength=topic_strength,
+    )
+
+
+def _pending_tool_call_names(messages: list) -> set[str]:
+    """
+    Names of tools whose tool_call has been emitted but no matching
+    tool_result has come back. Their schema MUST stay in the request,
+    otherwise the provider rejects the orphan tool_call.
+    """
+    pending: dict[str, str] = {}  # tool_call_id → tool_name
+    for m in messages:
+        mtype = getattr(m, "type", None)
+        if mtype == "ai":
+            for tc in getattr(m, "tool_calls", None) or []:
+                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
+                tc_name = _tool_name(tc)
+                if tc_id:
+                    pending[str(tc_id)] = tc_name
+        elif mtype == "tool":
+            tc_id = str(getattr(m, "tool_call_id", "") or "")
+            pending.pop(tc_id, None)
+    return set(pending.values())
+
+
+def _recently_called_tool_names(messages: list, lookback: int) -> set[str]:
+    """Names of tools the agent called in the last `lookback` AI rounds."""
+    if lookback <= 0:
+        return set()
+    seen_ai = 0
+    sticky: set[str] = set()
+    for m in reversed(messages):
+        if getattr(m, "type", None) != "ai":
+            continue
+        for tc in getattr(m, "tool_calls", None) or []:
+            sticky.add(_tool_name(tc))
+        seen_ai += 1
+        if seen_ai >= lookback:
+            break
+    return sticky
+
+
+def _normalize_tool_selection(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in ("", "none", "off"):
+        return None
+    if normalized not in ("relevance",):
+        raise ValueError(
+            f"unsupported tool_selection={value!r}; use None or 'relevance'"
+        )
+    return normalized
+
+
+_OPTIMIZATION_PROFILES: dict[str, dict[str, Any]] = {
+    "cautious": {
+        "recent_tools_window": 2,
+        "compression_mode": None,
+        "tool_selection": None,
+    },
+    "aggressive": {
+        "recent_tools_window": 1,
+        "compression_mode": "aggressive",
+        "tool_selection": "relevance",
+        "tool_top_k": 8,
+        "tool_dedup_old_results": True,
+    },
+}
+
+
+def _normalize_optimization_profile(profile: str | None) -> str | None:
+    if profile is None:
+        return None
+    normalized = str(profile).strip().lower().replace("-", "_")
+    if normalized in ("", "none", "custom"):
+        return None
+    if normalized not in _OPTIMIZATION_PROFILES:
+        allowed = ", ".join(sorted(_OPTIMIZATION_PROFILES))
+        raise ValueError(
+            f"unsupported optimization_profile={profile!r}; use {allowed}"
+        )
+    return normalized
+
+
+def _latest_human_text(messages: list) -> str:
+    """Pull the last HumanMessage's text, or '' if none."""
+    for m in reversed(messages):
+        if getattr(m, "type", None) == "human":
+            return _msg_text(m)
+    return ""
+
+
+# Compressor output is resorted by `source` so tool_call/tool_result order holds.
+# Empty AI tool-call messages get a synthetic marker to survive deduplication.
+_AI_TOOL_CALL_PREFIX = "[axor:tcs:"
+
+
+def _build_fragment_content(msg) -> str:
+    """
+    Pre-compress text view of a LangChain message, with a unique synthetic
+    marker for AIMessages that have empty content but carry tool_calls
+    (otherwise the dedup strategy would collapse them all into one).
+    """
+    text = _msg_text(msg)
+    mtype = getattr(msg, "type", None)
+    if mtype == "ai" and not text.strip():
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if tool_calls:
+            ids = [
+                tc.get("id") if isinstance(tc, dict)
+                else getattr(tc, "id", "")
+                for tc in tool_calls
+            ]
+            return _AI_TOOL_CALL_PREFIX + ",".join(str(i) for i in ids if i) + "]"
+    return text
+
+
+def _build_dedup_overrides(
+    messages: list, recent_tools_window: int,
+) -> dict[int, str]:
+    """
+    For ToolMessages whose `(tool_name, args, content)` repeats an earlier
+    call AND that fall outside the recent-tools window, return short reference
+    content to use instead of their original payload. Prevents the same 10kB
+    metric query from sitting in the prompt verbatim three times.
+
+    Content equality is required: time-varying tools (metric/log queries,
+    ticket lookups, file reads after edits) can return different evidence for
+    identical args. Matching on args alone would silently replace fresh
+    results with a pointer to a stale one.
+    """
+    if recent_tools_window < 0:
+        recent_tools_window = 0
+
+    tc_id_to_hash: dict[str, str] = {}
+    for m in messages:
+        if getattr(m, "type", None) != "ai":
+            continue
+        for tc in getattr(m, "tool_calls", None) or []:
+            tc_id = (tc.get("id") if isinstance(tc, dict)
+                     else getattr(tc, "id", "")) or ""
+            if not tc_id:
+                continue
+            name = _tool_name(tc)
+            args = (tc.get("args") if isinstance(tc, dict)
+                    else getattr(tc, "args", {})) or {}
+            tc_id_to_hash[str(tc_id)] = _hash_tool_call(name, args)
+
+    tool_indices = [
+        i for i, m in enumerate(messages)
+        if getattr(m, "type", None) == "tool"
+    ]
+    recent_set = (
+        set(tool_indices[-recent_tools_window:])
+        if recent_tools_window > 0 else set()
+    )
+
+    # (args_hash, content) → tool_call_id of first occurrence. Content is
+    # part of the key so that two calls with the same args but different
+    # results are NOT collapsed into a pointer.
+    seen_first_id: dict[tuple[str, str], str] = {}
+    overrides: dict[int, str] = {}
+    for i in tool_indices:
+        m = messages[i]
+        tc_id = str(getattr(m, "tool_call_id", "") or "")
+        h = tc_id_to_hash.get(tc_id)
+        if h is None:
+            continue
+        key = (h, _msg_text(m))
+        first = seen_first_id.get(key)
+        if first is None:
+            seen_first_id[key] = tc_id
+            continue
+        if i in recent_set:
+            continue
+        overrides[i] = (
+            f"[axor: duplicate tool call; identical args and result to "
+            f"tool_call_id={first} — see prior result]"
+        )
+    return overrides
+
+
+def _messages_to_fragments(
+    messages: list,
+    *,
+    recent_tools_window: int = 2,
+    dedup_old_results: bool = False,
+):
+    """
+    Build ContextFragments from LangChain messages. Source field encodes
+    the original position so we can reassemble in order after compression.
+
+    `kind`:
+      • system / human → "fact"
+      • ai with tool_calls → "ai_tool_call" (custom kind; compressor leaves
+        it alone other than the value-based grouping)
+      • ai prose → "assistant_prose" (matches what _compress_prose looks for)
+      • tool → "tool_result" (matches what _truncate_tool_outputs looks for)
+
+    `turn` field is set to position+1 so axor-core's age computations
+    (current_turn - turn) work meaningfully without us tracking a separate
+    monotonic turn counter.
+
+    `dedup_old_results=True` replaces the *content* of older ToolMessages
+    whose (tool_name, args) duplicates an earlier call with a short pointer.
+    Recent-window tool messages are never deduplicated.
     """
     from axor_core.contracts.context import ContextFragment
 
+    classified = _classify_messages(
+        messages,
+        recent_tools_window=recent_tools_window,
+    )
+    overrides = (
+        _build_dedup_overrides(messages, recent_tools_window)
+        if dedup_old_results else {}
+    )
     fragments = []
-    for i, msg in enumerate(messages):
-        mtype   = getattr(msg, "type", "")
-        content = _msg_text(msg)
-        if not content:
-            continue
-        tokens  = max(len(content) // 4, 1)
-        # age-based value: older tool results become ephemeral
-        age     = len(messages) - i
-
-        if mtype == "system":
-            kind, value = "fact", "pinned"
-        elif mtype == "human":
-            kind, value = "fact", "working"
-        elif mtype == "ai":
-            kind, value = "assistant_prose", "working"
+    for idx, (msg, value) in enumerate(classified):
+        mtype = getattr(msg, "type", None)
+        content = (
+            overrides[idx] if idx in overrides
+            else _build_fragment_content(msg)
+        )
+        if mtype == "ai":
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            # Tool-call metadata must remain paired with its ToolMessage.
+            kind = "ai_tool_call" if tool_calls else "assistant_prose"
         elif mtype == "tool":
-            kind  = "tool_result"
-            value = "ephemeral" if age > 4 else "working"
-        else:
-            kind, value = "fact", "working"
+            kind = "tool_result"
+        else:  # system, human, unknown
+            kind = "fact"
 
         fragments.append(ContextFragment(
             kind=kind,
             content=content,
-            token_estimate=tokens,
-            source=f"langchain:{mtype}:{i}",
-            relevance=1.0 if age <= 2 else max(0.3, 1.0 - age * 0.08),
-            value=value,
-            turn=0,  # turn tracking managed by middleware, not core
+            token_estimate=max(len(content) // 4, 1),
+            source=f"lc:{idx}",
+            relevance=1.0,
+            value=value.value,
+            turn=idx + 1,
         ))
     return fragments
 
 
-def _fragments_to_messages(
-    context_view,
-    original_messages: list,
-    personality: str | None,
-):
-    """
-    Reconstruct a LangChain message list from a ContextView.
-
-    Strategy:
-      1. Always keep original system messages (they are pinned in axor anyway).
-      2. Always keep the last human message verbatim.
-      3. Replace the rest with compressed fragments from ContextView.
-      4. Re-attach tool-call AI messages paired with their ToolMessages
-         so the conversation remains structurally valid for the model API.
-
-    Returns (new_messages, was_changed).
-    """
-    try:
-        from langchain_core.messages import SystemMessage
-    except ImportError:
-        # benchmark / test context — use a simple stub
-        class SystemMessage:  # type: ignore[no-redef]
-            def __init__(self, content: str):
-                self.type    = "system"
-                self.content = content
-
-    system_msgs = [m for m in original_messages if getattr(m, "type", None) == "system"]
-    last_human  = next(
-        (m for m in reversed(original_messages) if getattr(m, "type", None) == "human"),
-        None,
-    )
-
-    # Build middle part from compressed fragments
-    # Skip pinned (system) and pure prose fragments — they come from system/last_human
-    middle: list = []
-    for frag in context_view.visible_fragments:
-        if frag.value == "pinned":
-            continue  # already covered by system_msgs
-        if frag.kind == "tool_result":
-            # Try to find original ToolMessage for this fragment
-            src_idx = _parse_source_index(frag.source)
-            if src_idx is not None and src_idx < len(original_messages):
-                orig = original_messages[src_idx]
-                if frag.content != _msg_text(orig):
-                    # Content was compressed — create a copy with truncated content
-                    try:
-                        orig = orig.model_copy(update={"content": frag.content})
-                    except AttributeError:
-                        import copy
-                        orig = copy.copy(orig)
-                        orig.content = frag.content
-                middle.append(orig)
-            # else: fragment came from compressor summary — skip (no paired AI msg)
-        elif frag.kind == "assistant_prose":
-            src_idx = _parse_source_index(frag.source)
-            if src_idx is not None and src_idx < len(original_messages):
-                middle.append(original_messages[src_idx])
-
-    # Ensure every ToolMessage has its paired AI message (tool_calls present)
-    middle = _repair_tool_pairs(middle, original_messages)
-
-    # Assemble: system → personality → middle → last_human
-    result = list(system_msgs)
-    if personality and not system_msgs:
-        result.append(SystemMessage(content=personality))
-    elif personality and system_msgs:
-        merged = f"{personality}\n\n{_msg_text(system_msgs[0])}"
-        try:
-            result[0] = system_msgs[0].model_copy(update={"content": merged})
-        except AttributeError:
-            import copy
-            try:
-                result[0] = copy.copy(system_msgs[0])
-                result[0].content = merged
-            except (AttributeError, TypeError):
-                pass  # truly immutable — keep original
-
-    result.extend(m for m in middle if getattr(m, "type", None) not in ("system", "human"))
-    if last_human is not None:
-        result.append(last_human)
-
-    return result, result != original_messages
-
-
-def _parse_source_index(source: str) -> int | None:
+def _parse_lc_source_index(source: str) -> int | None:
     """Extract the original message index from a fragment source string."""
+    if not source.startswith("lc:"):
+        return None
     try:
-        return int(source.split(":")[-1])
-    except (ValueError, IndexError):
+        return int(source[3:])
+    except ValueError:
         return None
 
 
-def _repair_tool_pairs(middle: list, originals: list) -> list:
+def _message_tool_call_ids(msg) -> set[str]:
+    ids: set[str] = set()
+    for tc in getattr(msg, "tool_calls", None) or []:
+        tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
+        if tc_id:
+            ids.add(str(tc_id))
+    return ids
+
+
+def _fragments_to_messages(compressed_fragments, original_messages: list):
     """
-    Ensure every ToolMessage in `middle` is preceded by the AI message
-    that issued the tool call. Without this, most model APIs reject the input.
+    Map compressed fragments back to LangChain messages.
+
+    Strategy:
+      • Index fragments by their `lc:{idx}` source.
+      • Walk original_messages in order; emit each message that survived
+        (with content possibly updated by truncate / prose-cap strategies).
+      • Drop original messages whose fragment was eliminated by dedup or
+        empty-removal.
+      • Synthesized fragments (e.g. `compressor:prose_summary` from
+        `_compress_prose`) get inserted as a HumanMessage right after the
+        system + first-human prefix, so the model sees them as authoritative
+        context. This mirrors langchain's SummarizationMiddleware idiom.
+      • AI tool_call messages are returned verbatim — the synthetic content
+        marker we put in their fragments is just a dedup anchor, not real
+        content to be propagated back.
     """
-    # build index: tool_call_id → AI message that issued it
-    tool_call_to_ai: dict[str, Any] = {}
-    for msg in originals:
+    by_idx: dict[int, Any] = {}
+    synthesized: list = []
+    for f in compressed_fragments:
+        idx = _parse_lc_source_index(f.source)
+        if idx is not None:
+            by_idx[idx] = f
+        else:
+            synthesized.append(f)
+
+    out_by_idx: dict[int, Any] = {}
+    for i, orig in enumerate(original_messages):
+        if i not in by_idx:
+            # Never drop AI tool-call messages; providers require paired results.
+            if (getattr(orig, "type", None) == "ai"
+                    and (getattr(orig, "tool_calls", None) or [])):
+                out_by_idx[i] = orig
+            continue
+        f = by_idx[i]
+        if f.kind == "ai_tool_call":
+            out_by_idx[i] = orig
+            continue
+        original_text = _msg_text(orig)
+        if f.content == original_text:
+            out_by_idx[i] = orig
+        else:
+            # Preserve message metadata; only compressed content changes.
+            try:
+                new_msg = orig.model_copy(update={"content": f.content})
+            except AttributeError:
+                import copy
+                new_msg = copy.copy(orig)
+                try:
+                    new_msg.content = f.content
+                except (AttributeError, TypeError):
+                    new_msg = orig
+            out_by_idx[i] = new_msg
+
+    # Restore required ToolMessages if compression removed a paired result.
+    required_tool_ids: set[str] = set()
+    for msg in out_by_idx.values():
         if getattr(msg, "type", None) == "ai":
-            for tc in getattr(msg, "tool_calls", []) or []:
-                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
-                if tc_id:
-                    tool_call_to_ai[tc_id] = msg
+            required_tool_ids.update(_message_tool_call_ids(msg))
+    existing_tool_ids = {
+        str(getattr(msg, "tool_call_id", ""))
+        for msg in out_by_idx.values()
+        if getattr(msg, "type", None) == "tool" and getattr(msg, "tool_call_id", "")
+    }
+    missing_tool_ids = required_tool_ids - existing_tool_ids
+    if missing_tool_ids:
+        for i, orig in enumerate(original_messages):
+            if getattr(orig, "type", None) != "tool":
+                continue
+            tc_id = str(getattr(orig, "tool_call_id", ""))
+            if tc_id in missing_tool_ids:
+                out_by_idx[i] = orig
 
-    repaired = []
-    seen_ai: set[int] = set()
-    for msg in middle:
-        if getattr(msg, "type", None) == "tool":
-            tc_id = getattr(msg, "tool_call_id", None)
-            ai_msg = tool_call_to_ai.get(tc_id) if tc_id else None
-            if ai_msg is not None and id(ai_msg) not in seen_ai:
-                repaired.append(ai_msg)
-                seen_ai.add(id(ai_msg))
-        repaired.append(msg)
-    return repaired
+    out = [out_by_idx[i] for i in sorted(out_by_idx)]
+
+    if synthesized:
+        try:
+            from langchain_core.messages import HumanMessage
+        except ImportError:
+            return out
+        synth_msgs = [
+            HumanMessage(
+                content=f"[axor: condensed prior context]\n\n{f.content}",
+                additional_kwargs={"lc_source": "axor.compress_prose"},
+            )
+            for f in synthesized
+        ]
+        insert_idx = 0
+        seen_first_human = False
+        for i, m in enumerate(out):
+            mtype = getattr(m, "type", None)
+            if mtype == "system":
+                insert_idx = i + 1
+            elif mtype == "human" and not seen_first_human:
+                insert_idx = i + 1
+                seen_first_human = True
+            else:
+                break
+        out = out[:insert_idx] + synth_msgs + out[insert_idx:]
+
+    return out
 
 
-# ── Core governance (no LangChain imports) ─────────────────────────────────────
+from typing import NotRequired
+from langchain.agents.middleware import AgentState
+
+
+class AxorState(AgentState):
+    # hash(tool_name + args) -> cached content persisted by LangGraph state.
+    tool_result_cache: NotRequired[dict[str, str]]
+
 
 class _AxorGovernanceCore:
     """
-    Pure governance logic — no LangChain imports.
-
-    Uses axor-core engines:
-      ContextManager      → fragment-aware compression via ContextCompressor
-      BudgetTracker       → tracks token spend per turn
-      BudgetPolicyEngine  → decides when to compress harder or stop
+    Pure governance logic. No LangChain imports here so this module is
+    importable without langchain (helpful for unit tests of helpers).
     """
-
-    # Below this token count, compression pipeline is skipped entirely.
-    # Governance (tool filtering, budget tracking) still applies.
-    _BYPASS_TOKEN_THRESHOLD = 4000
 
     def __init__(
         self,
         soft_token_limit: int | None = None,
         hard_token_limit: int | None = None,
-        compression_mode: str = "auto",
-        bypass_token_threshold: int | None = None,
         allowed_tools: list[str] | None = None,
         denied_tools:  list[str] | None = None,
         personality:   str | None = None,
@@ -430,13 +942,51 @@ class _AxorGovernanceCore:
         track_tool_stats: bool = False,
         verbose: bool = False,
         telemetry: str | None = None,
+        cache_tools: list[str] | None = None,
+        max_tool_cache_entries: int | None = 100,
+        recent_tools_window: int | None = None,
+        compression_mode: str | None = None,
+        optimization_profile: str | None = None,
+        tool_selection: str | None = None,
+        tool_top_k: int | None = None,
+        tool_min_keep: int = 3,
+        tool_sticky_lookback: int = 4,
+        tool_dedup_old_results: bool | None = None,
+        tool_selection_stable: bool = True,
+        token_cost_rates: Any | None = None,
     ) -> None:
+        profile = _normalize_optimization_profile(optimization_profile)
+        profile_cfg = _OPTIMIZATION_PROFILES.get(profile or "", {})
+        effective_recent_tools_window = (
+            recent_tools_window
+            if recent_tools_window is not None
+            else profile_cfg.get("recent_tools_window", 2)
+        )
+        effective_compression_mode = (
+            compression_mode
+            if compression_mode is not None
+            else profile_cfg.get("compression_mode")
+        )
+        effective_tool_selection = (
+            tool_selection
+            if tool_selection is not None
+            else profile_cfg.get("tool_selection")
+        )
+        effective_tool_top_k = (
+            tool_top_k
+            if tool_top_k is not None
+            else profile_cfg.get("tool_top_k")
+        )
+        effective_tool_dedup = (
+            tool_dedup_old_results
+            if tool_dedup_old_results is not None
+            else bool(profile_cfg.get("tool_dedup_old_results", False))
+        )
+
         self._soft_limit   = soft_token_limit
         self._hard_limit   = hard_token_limit or (
             int(soft_token_limit * 1.5) if soft_token_limit else None
         )
-        self._compression_mode = compression_mode
-        self._bypass_threshold = bypass_token_threshold if bypass_token_threshold is not None else self._BYPASS_TOKEN_THRESHOLD
         self._allowed_tools    = set(allowed_tools) if allowed_tools else None
         self._denied_tools     = set(denied_tools)  if denied_tools  else set()
         self._personality      = personality
@@ -447,21 +997,47 @@ class _AxorGovernanceCore:
         self._tool_retry_delay   = tool_retry_delay
         self._track_tool_stats   = track_tool_stats
         self._verbose            = verbose
+        self._cache_tools = set(cache_tools) if cache_tools else None
+        self._optimization_profile = profile
+        self._recent_tools_window = max(0, int(effective_recent_tools_window))
+        self._compression_mode_override = _normalize_compression_mode_name(
+            effective_compression_mode
+        )
+        self._tool_selection = _normalize_tool_selection(effective_tool_selection)
+        self._tool_top_k = (
+            int(effective_tool_top_k)
+            if effective_tool_top_k is not None and effective_tool_top_k > 0
+            else None
+        )
+        self._tool_min_keep = max(0, int(tool_min_keep))
+        self._tool_sticky_lookback = max(0, int(tool_sticky_lookback))
+        self._tool_dedup_old_results = bool(effective_tool_dedup)
+        # Cache the relevance-gated tool selection within a session so the
+        # provider's prompt cache (Anthropic / OpenAI) keeps prefix bytes
+        # stable across consecutive `wrap_model_call` invocations in the
+        # same agent.invoke loop. Without this, sticky-tool inclusion can
+        # add a tool between turn N and turn N+1, mutating the tools
+        # schema in the cached prefix and dropping the cache hit.
+        self._tool_selection_stable = bool(tool_selection_stable)
+        self._tool_selection_cache: tuple | None = None
+        # Bound checkpointed tool cache; None means caller accepts unbounded state.
+        self._max_tool_cache_entries = max_tool_cache_entries
+        self._token_cost_rates = token_cost_rates
 
         self._turn        = 0
         self._cancelled   = False
-        self._session_id  = f"lc-{id(self):x}"
+        # Use a UUID instead of `id(self)` — Python may reuse object IDs
+        # after GC, so two sequential AxorMiddleware instances could end up
+        # sharing a session_id and polluting any tracker that keys by it.
+        import uuid as _uuid
+        self._session_id  = f"lc-{_uuid.uuid4().hex[:12]}"
         self._tool_stats  = ToolStats() if track_tool_stats else None
 
-        # axor-core engines
-        self._ctx_manager: Any = None
         self._budget_tracker: Any = None
-        self._budget_engine: Any = None
+        self._budget_engine:  Any = None
         self._engines_ready = False
 
-        # Telemetry: build a pipeline when caller opts in via kwarg or
-        # AXOR_TELEMETRY env. A one-time notice is printed to stderr when
-        # telemetry is off, so new users discover the option.
+        # Build telemetry lazily; off-mode shows a one-time opt-in notice.
         self._telemetry_mode = _resolve_telemetry_mode(telemetry)
         self._telemetry = _build_telemetry_pipeline(
             mode=self._telemetry_mode,
@@ -478,22 +1054,17 @@ class _AxorGovernanceCore:
         except Exception:
             return ""
 
-    # ── lazy engine init ──────────────────────────────────────────────────────
-
     def _ensure_engines(self) -> bool:
-        """Init axor-core engines on first use. Returns False if unavailable."""
+        """Init axor-core BudgetTracker on first use. False if axor-core absent."""
         if self._engines_ready:
             return True
         try:
-            from axor_core.context.manager import ContextManager
             from axor_core.budget.tracker import BudgetTracker
             from axor_core.budget.estimator import BudgetEstimator
             from axor_core.budget.policy_engine import BudgetPolicyEngine
-
-            self._ctx_manager     = ContextManager()
-            self._budget_tracker  = BudgetTracker()
-            estimator             = BudgetEstimator()
-            self._budget_engine   = BudgetPolicyEngine(
+            self._budget_tracker = BudgetTracker()
+            estimator = BudgetEstimator()
+            self._budget_engine = BudgetPolicyEngine(
                 tracker=self._budget_tracker,
                 estimator=estimator,
                 soft_limit=self._soft_limit,
@@ -507,216 +1078,137 @@ class _AxorGovernanceCore:
             return True
         except ImportError:
             if self._verbose:
-                print("[axor] axor-core not installed — using built-in compression")
+                print("[axor] axor-core not installed — budget tracking disabled")
             return False
 
-    # ── compression mode helper ───────────────────────────────────────────────
-
-    def _resolve_compression_mode(self, n_messages: int):
+    def _select_relevant_tools(self, tools: list, messages: list,
+                                signal=None) -> list:
         """
-        Map user's compression_mode string to axor-core CompressionMode.
-        In "auto" mode, derive from session length.
+        Drop tools whose names/descriptions don't match keywords from the
+        latest user task. Always keeps:
+          • tools mentioned in pending tool_calls (otherwise provider rejects),
+          • tools called within the last N AI rounds (sticky),
+          • at least `tool_min_keep` tools in total.
+
+        When `signal.nature == READONLY` we additionally drop tools whose
+        names match destructive verbs — "explain X" never needs `write_*`.
         """
-        from axor_core.contracts.policy import CompressionMode
-        if self._compression_mode == "auto":
-            if n_messages <= 6:
-                return CompressionMode.LIGHT
-            elif n_messages <= 20:
-                return CompressionMode.BALANCED
-            else:
-                return CompressionMode.AGGRESSIVE
-        mapping = {
-            "minimal":  CompressionMode.AGGRESSIVE,
-            "moderate": CompressionMode.BALANCED,
-            "broad":    CompressionMode.LIGHT,
-        }
-        return mapping.get(self._compression_mode, CompressionMode.BALANCED)
+        if (self._tool_selection != "relevance"
+                or not tools
+                or self._tool_top_k is None):
+            return tools
 
-    def _resolve_context_mode(self, n_messages: int):
-        from axor_core.contracts.policy import ContextMode
-        if n_messages <= 6:
-            return ContextMode.BROAD
-        elif n_messages <= 20:
-            return ContextMode.MODERATE
-        else:
-            return ContextMode.MINIMAL
+        latest = _latest_human_text(messages)
+        keywords = _extract_query_keywords(latest)
+        if not keywords:
+            return tools
 
-    def _resolve_policy(self, messages: list):
-        """Build a minimal ExecutionPolicy for this turn."""
-        from axor_core.contracts.policy import (
-            ExecutionPolicy, CompressionMode, ContextMode,
-            ChildMode, ExportMode, ToolPolicy,
-        )
-        n = len(messages)
-        return ExecutionPolicy(
-            name="axor-langchain",
-            context_mode=self._resolve_context_mode(n),
-            compression_mode=self._resolve_compression_mode(n),
-            child_mode=ChildMode.DENIED,
-            export_mode=ExportMode.SUMMARY,
-            tool_policy=ToolPolicy(
-                allow_read=True,
-                allow_write=True,
-                allow_bash=True,
-                allow_search=True,
-            ),
-        )
+        # Cache key tied to (latest user message, the available tool name
+        # set). When the user hasn't sent a new message, the selection is
+        # reused verbatim — this is what keeps the tools schema bytes
+        # identical across consecutive `wrap_model_call` invocations and
+        # lets Anthropic / OpenAI prompt cache hit on the prefix.
+        cache_key: tuple | None = None
+        if self._tool_selection_stable:
+            tool_name_sig = tuple(_tool_attr(t, "name") for t in tools)
+            cache_key = (latest, tool_name_sig)
+            cached = self._tool_selection_cache
+            if cached is not None and cached[0] == cache_key:
+                kept_idxs = cached[1]
+                # Guard: still need to honor the *current* pending set even
+                # when reusing a cached decision — provider rejects orphan
+                # tool_call/tool_result if a freshly-pending tool got
+                # dropped from a prior cached set.
+                pending = _pending_tool_call_names(messages)
+                if pending:
+                    pending_idxs = {
+                        i for i, t in enumerate(tools)
+                        if _tool_attr(t, "name") in pending
+                    }
+                    kept_idxs = kept_idxs | pending_idxs
+                return [tools[i] for i in sorted(kept_idxs)]
 
-    # ── govern messages ───────────────────────────────────────────────────────
+        # 1. Anchors that survive any score. Sticky behavior runs on
+        #    cache miss; subsequent calls within the same user turn hit
+        #    the cache before reaching this point, so sticky-induced
+        #    growth never mutates the cached tool list mid-turn.
+        pending = _pending_tool_call_names(messages)
+        sticky = _recently_called_tool_names(messages, self._tool_sticky_lookback)
+        anchors = pending | sticky
 
-    def _govern_messages_core(self, messages: list) -> tuple[list, bool]:
-        """
-        Use axor-core ContextManager to compress messages.
-        Returns (compressed_messages, changed).
-        Sets self._cancelled if hard budget exceeded.
-        """
-        if not self._ensure_engines():
-            return self._govern_messages_fallback(messages)
+        # 2. Compute task topic distribution once. Tools whose name tokens
+        #    sit in the task's dominant topic get a proportional bonus
+        #    inside `_score_tool_relevance` — this is what makes
+        #    `security_scan` win for a security task even when the prompt
+        #    uses "vulnerable" rather than "security".
+        topic_strength = _compute_topic_strength(keywords)
 
-        from axor_core.contracts.context import RawExecutionState
+        # 3. Score remaining tools
+        scored: list[tuple[int, float, Any]] = []
+        keep_idxs: set[int] = set()
+        for idx, t in enumerate(tools):
+            name = _tool_attr(t, "name")
+            if name in anchors:
+                keep_idxs.add(idx)
+                continue
+            score = _score_tool_relevance(
+                t, keywords, topic_strength=topic_strength,
+            )
+            scored.append((idx, score, t))
 
-        self._turn += 1
+        # 3. Optional READONLY filter: drop destructive-named tools that
+        #    aren't anchored. If filtering would push us below floor we skip it.
+        is_readonly = False
+        try:
+            from axor_core.contracts.policy import TaskNature
+            is_readonly = signal is not None and signal.nature == TaskNature.READONLY
+        except ImportError:
+            is_readonly = False
+        if is_readonly:
+            kept_after_readonly = []
+            for idx, score, t in scored:
+                if _name_has_destructive_token(_tool_attr(t, "name")):
+                    if self._verbose:
+                        print(f"[axor] tool dropped (readonly task): "
+                              f"{_tool_attr(t, 'name')!r}")
+                    continue
+                kept_after_readonly.append((idx, score, t))
+            # Floor: never go below tool_min_keep + anchors total.
+            min_total = max(self._tool_min_keep, len(anchors))
+            if len(kept_after_readonly) + len(keep_idxs) >= min_total:
+                scored = kept_after_readonly
 
-        # ── budget check via policy engine ────────────────────────────────────
-        current_tokens = sum(_msg_tokens(m) for m in messages)
-        total_spent = self._budget_tracker.total_tokens()
+        # 4. Top-K by score, with floor
+        budget = max(0, self._tool_top_k - len(keep_idxs))
+        scored.sort(key=lambda p: -p[1])
+        for idx, score, _ in scored[:budget]:
+            keep_idxs.add(idx)
+        # Top-up to floor with the next-best (even if score is 0)
+        if len(keep_idxs) < self._tool_min_keep:
+            for idx, _, _ in scored[budget:]:
+                keep_idxs.add(idx)
+                if len(keep_idxs) >= self._tool_min_keep:
+                    break
 
-        if self._hard_limit and total_spent + current_tokens > self._hard_limit:
-            if self._verbose:
-                print(f"[axor] hard budget stop: {total_spent} tokens spent")
-            self._cancelled = True
-            return messages, False
+        if len(keep_idxs) >= len(tools):
+            # No reduction — cache the no-op too so subsequent calls with
+            # the same key skip the work entirely.
+            if self._tool_selection_stable and cache_key is not None:
+                self._tool_selection_cache = (cache_key, frozenset(range(len(tools))))
+            return tools
 
-        if self._soft_limit and total_spent > self._soft_limit and self._verbose:
-            print(f"[axor] soft limit warning: {total_spent}/{self._soft_limit} tokens")
+        # Persist the decision under the (latest, tool_names) key so
+        # follow-up calls in the same agent.invoke loop reuse it.
+        if self._tool_selection_stable and cache_key is not None:
+            self._tool_selection_cache = (cache_key, frozenset(keep_idxs))
 
-        # ── record this turn's input into budget tracker ───────────────────────
-        self._budget_tracker.record(
-            node_id=self._session_id,
-            input_tokens=current_tokens,
-            output_tokens=0,
-        )
-
-        # ── bypass: skip compression for small contexts ───────────────────────
-        # Budget check and recording still happen above — only the
-        # compression pipeline (fragments → compress → reconstruct) is skipped.
-        if self._bypass_threshold and current_tokens < self._bypass_threshold:
-            if self._verbose:
-                print(f"[axor] bypass: {current_tokens} tokens < {self._bypass_threshold} threshold")
-            return messages, False
-
-        # ── build context via axor-core pipeline ──────────────────────────────
-        task = _msg_text(messages[-1]) if messages else ""
-        lineage = _make_lineage(self._session_id)
-        policy  = self._resolve_policy(messages)
-
-        # Convert messages → ContextFragments and add to manager
-        fragments = _messages_to_fragments(messages)
-        raw_state = RawExecutionState(
-            task=task,
-            session_id=self._session_id,
-            parent_export=None,
-            session_state={},
-            memory_fragments=[],
-            lineage=lineage,
-            prior_turns=[],   # handled via fragments
-        )
-        # Feed all fragments as memory_fragments (plain strings)
-        # and let ContextManager compress + select
-        raw_state.memory_fragments = [f.content for f in fragments
-                                       if f.value not in ("pinned",)]
-
-        # Inject fragments via public API
-        pinned = [f for f in fragments if f.value == "pinned"]
-        non_pinned = [f for f in fragments if f.value != "pinned"]
-        for frag in pinned:
-            self._ctx_manager.pin_fragment(frag)
-        if non_pinned:
-            self._ctx_manager.ingest_fragments(non_pinned)
-
-        context_view = self._ctx_manager.build(
-            raw_state=raw_state,
-            lineage=lineage,
-            policy=policy,
-        )
-
+        kept = [tools[i] for i in sorted(keep_idxs)]
         if self._verbose:
-            ratio = context_view.compression_ratio
-            before = sum(_msg_tokens(m) for m in messages)
-            after  = context_view.token_count
-            if abs(before - after) > 10:
-                print(
-                    f"[axor] turn {self._turn}: {before}→{after} tokens "
-                    f"(ratio={ratio:.2f}, mode={policy.compression_mode.value})"
-                )
-
-        compressed, changed = _fragments_to_messages(
-            context_view, messages, self._personality
-        )
-        return compressed, changed
-
-    def _govern_messages_fallback(self, messages: list) -> tuple[list, bool]:
-        """
-        Pure-Python fallback when axor-core is not installed.
-        Simple window + tool truncation — same as original middleware.
-        """
-        self._turn += 1
-
-        # bypass: skip compression for small contexts
-        current_tokens = sum(_msg_tokens(m) for m in messages)
-        if self._bypass_threshold and current_tokens < self._bypass_threshold:
-            if self._verbose:
-                print(f"[axor] bypass (fallback): {current_tokens} tokens < {self._bypass_threshold} threshold")
-            return messages, False
-
-        n = len(messages)
-        if self._compression_mode == "auto":
-            mode = "broad" if n <= 6 else "moderate" if n <= 20 else "minimal"
-        else:
-            mode = self._compression_mode
-
-        system     = [m for m in messages if getattr(m, "type", None) == "system"]
-        non_system = [m for m in messages if getattr(m, "type", None) != "system"]
-        windows    = {"minimal": 6, "moderate": 16, "broad": 40}
-        window     = windows.get(mode, 16)
-        kept       = non_system[-window:] if len(non_system) > window else non_system
-        max_tool   = {"minimal": 800, "moderate": 2000, "broad": 8000}.get(mode, 2000)
-
-        compressed = []
-        for msg in kept:
-            content = getattr(msg, "content", "")
-            if getattr(msg, "type", None) == "tool" and isinstance(content, str):
-                if len(content) > max_tool:
-                    head = content[:max_tool // 2]
-                    tail = content[-(max_tool // 4):]
-                    truncated = f"{head}\n…[truncated by axor]…\n{tail}"
-                    try:
-                        msg = msg.model_copy(update={"content": truncated})
-                    except AttributeError:
-                        import copy; msg = copy.copy(msg); msg.content = truncated
-            compressed.append(msg)
-
-        result = system + compressed
-
-        # personality injection
-        if self._personality:
-            from langchain_core.messages import SystemMessage
-            if system:
-                merged = f"{self._personality}\n\n{_msg_text(system[0])}"
-                try:
-                    result[0] = system[0].model_copy(update={"content": merged})
-                except AttributeError:
-                    pass
-            else:
-                result.insert(0, SystemMessage(content=self._personality))
-
-        total_spent = sum(_msg_tokens(m) for m in messages)
-        if self._hard_limit and total_spent > self._hard_limit:
-            self._cancelled = True
-
-        return result, result != messages
-
-    # ── tool filter ───────────────────────────────────────────────────────────
+            dropped = [_tool_attr(t, "name") for i, t in enumerate(tools)
+                       if i not in keep_idxs]
+            print(f"[axor] tool relevance: kept {len(kept)}/{len(tools)}; "
+                  f"dropped={dropped}")
+        return kept
 
     def _filter_tools(self, tools: list) -> list:
         if not self._allowed_tools and not self._denied_tools:
@@ -742,23 +1234,220 @@ class _AxorGovernanceCore:
             filtered.append(tool)
         return filtered
 
-    def _record_usage(self, response) -> None:
-        usage = getattr(response, "usage_metadata", None)
-        if usage and self._engines_ready:
-            output_tokens = getattr(usage, "output_tokens", 0) or 0
-            self._budget_tracker.record(
-                node_id=self._session_id,
-                input_tokens=0,
-                output_tokens=output_tokens,
-            )
-            if self._verbose:
-                total = self._budget_tracker.total_tokens()
-                print(f"[axor] usage: +{output_tokens} out tokens (total: {total})")
+    def _merge_personality(self, request):
+        """
+        If personality is configured, prepend it to request.system_message and
+        return a new ModelRequest via override(). Otherwise return request
+        unchanged. No cache_control wrapping — that's AnthropicPromptCachingMiddleware's
+        job.
+        """
+        if not self._personality:
+            return request
+        sys_msg = getattr(request, "system_message", None)
+        original_text = _msg_text(sys_msg) if sys_msg is not None else ""
+        merged_text = (
+            f"{self._personality}\n\n{original_text}"
+            if original_text else self._personality
+        )
+        try:
+            from langchain_core.messages import SystemMessage
+        except ImportError:
+            return request
+        if sys_msg is None:
+            new_sys = SystemMessage(content=merged_text)
+        else:
+            try:
+                new_sys = sys_msg.model_copy(update={"content": merged_text})
+            except AttributeError:
+                new_sys = SystemMessage(content=merged_text)
+        return request.override(system_message=new_sys)
 
-    # ── tool execution ────────────────────────────────────────────────────────
+    def _resolve_execution_policy(self, messages: list):
+        """
+        Classify the latest user task with axor-core's HeuristicClassifier
+        and pick an `ExecutionPolicy` via `PolicySelector`. The policy
+        carries `compression_mode` (AGGRESSIVE / BALANCED / LIGHT) and
+        `context_mode` (MINIMAL / MODERATE / BROAD), which we feed into
+        the compressor and (eventually) the selector.
+
+        Returns None if axor-core is not installed.
+        """
+        try:
+            from axor_core.policy.selector import PolicySelector
+        except ImportError:
+            return None
+        text = _latest_human_text(messages)
+        signal = _classify_task_sync(text)
+        return PolicySelector().select(signal)
+
+    def _compress_via_axor_core(self, request):
+        """
+        Run the axor-core ContextCompressor on `request.messages` using
+        the FragmentValue policy from `_classify_messages` AND the
+        compression mode resolved by `PolicySelector` from the latest
+        user task (TaskAnalyzer pipeline).
+
+        Mode mapping examples (from PolicySelector):
+          • "explain this function" → FOCUSED + READONLY → AGGRESSIVE
+          • "write a test for X"    → FOCUSED + GENERATIVE → BALANCED
+          • "fix the auth bug"      → FOCUSED + MUTATIVE → BALANCED
+          • "rewrite the backend"   → EXPANSIVE → LIGHT
+
+        Compressor strategy reminder:
+          • PINNED fragments untouched (system, all humans, latest AI
+            tool_call, recent K tool messages).
+          • EPHEMERAL fragments truncated aggressively regardless of mode.
+          • WORKING fragments get full pipeline by `mode` (truncate
+            threshold, prose cap).
+          • KNOWLEDGE fragments get dedup + error collapse only.
+        """
+        try:
+            from axor_core.context.compressor import ContextCompressor
+            from axor_core.contracts.policy import CompressionMode
+        except ImportError:
+            return request
+
+        messages = list(getattr(request, "messages", []) or [])
+        if not messages:
+            return request
+
+        # Explicit mode wins; otherwise policy selection falls back to balanced.
+        try:
+            if self._compression_mode_override is not None:
+                mode = CompressionMode[self._compression_mode_override]
+            else:
+                policy = self._resolve_execution_policy(messages)
+                mode = policy.compression_mode if policy else CompressionMode.BALANCED
+        except Exception:
+            mode = CompressionMode.BALANCED
+
+        try:
+            fragments = _messages_to_fragments(
+                messages,
+                recent_tools_window=self._recent_tools_window,
+                dedup_old_results=self._tool_dedup_old_results,
+            )
+            compressor = ContextCompressor()
+            result = compressor.compress(
+                fragments,
+                mode=mode,
+                current_turn=len(messages) + 1,
+            )
+            new_messages = _fragments_to_messages(result.fragments, messages)
+        except Exception as e:
+            if self._verbose:
+                print(f"[axor] compression failed, passing through: {e}")
+            return request
+
+        # Avoid override() when the effective message text did not change.
+        if len(new_messages) == len(messages) and all(
+            _msg_text(a) == _msg_text(b)
+            for a, b in zip(new_messages, messages)
+        ):
+            return request
+
+        if self._verbose:
+            before = sum(_msg_tokens(m) for m in messages)
+            after  = sum(_msg_tokens(m) for m in new_messages)
+            print(f"[axor] compress: {before}→{after} tokens "
+                  f"({len(messages)}→{len(new_messages)} msgs, "
+                  f"mode={mode.name}, "
+                  f"strategies: {result.strategies_applied})")
+
+        return request.override(messages=new_messages)
+
+    def _enforce_hard_limit(self, request) -> None:
+        """
+        Raise `BudgetExceededError` if the upcoming call would exceed the
+        hard token limit. Estimate-based gate; no state mutation.
+        """
+        if not self._engines_ready or not self._hard_limit:
+            return
+        total_spent = self._budget_tracker.total_tokens()
+        messages = list(getattr(request, "messages", []) or [])
+        sys_msg = getattr(request, "system_message", None)
+        if sys_msg is not None:
+            messages = [sys_msg, *messages]
+        projected = sum(_msg_tokens(m) for m in messages)
+
+        if self._soft_limit and total_spent > self._soft_limit and self._verbose:
+            print(f"[axor] soft limit warning: "
+                  f"{total_spent}/{self._soft_limit} tokens")
+
+        if total_spent + projected > self._hard_limit:
+            if self._verbose:
+                print(f"[axor] hard budget stop: {total_spent} spent + "
+                      f"{projected} projected > {self._hard_limit}")
+            from axor_core.errors import BudgetExceededError
+            raise BudgetExceededError(
+                spent=total_spent,
+                projected=projected,
+                limit=self._hard_limit,
+            )
+
+    def _record_usage_from_response(self, response) -> None:
+        """
+        Record provider-counted input, output, and prompt-cache tokens.
+
+        Anthropic reports cache_creation_input_tokens and
+        cache_read_input_tokens separately from input_tokens. Recording all
+        counters here keeps Axor's budget total aligned with provider usage
+        volume; pre-call estimation never touches the tracker.
+        """
+        if not self._engines_ready:
+            return
+        usages = []
+        direct_usage = getattr(response, "usage_metadata", None)
+        if direct_usage:
+            usages.append(direct_usage)
+        for msg in getattr(response, "result", []) or []:
+            msg_usage = getattr(msg, "usage_metadata", None)
+            if msg_usage:
+                usages.append(msg_usage)
+        if not usages:
+            return
+
+        in_t = 0
+        out_t = 0
+        cache_creation_t = 0
+        cache_read_t = 0
+        for usage in usages:
+            if isinstance(usage, dict):
+                in_t  += usage.get("input_tokens", 0) or 0
+                out_t += usage.get("output_tokens", 0) or 0
+                cache_creation_t += (
+                    usage.get("cache_creation_input_tokens", 0) or 0
+                )
+                cache_read_t += usage.get("cache_read_input_tokens", 0) or 0
+            else:
+                in_t  += getattr(usage, "input_tokens", 0) or 0
+                out_t += getattr(usage, "output_tokens", 0) or 0
+                cache_creation_t += (
+                    getattr(usage, "cache_creation_input_tokens", 0) or 0
+                )
+                cache_read_t += (
+                    getattr(usage, "cache_read_input_tokens", 0) or 0
+                )
+        self._budget_tracker.record(
+            node_id=self._session_id,
+            input_tokens=in_t,
+            output_tokens=out_t,
+            cache_creation_input_tokens=cache_creation_t,
+            cache_read_input_tokens=cache_read_t,
+        )
+        if self._verbose:
+            total = self._budget_tracker.total_tokens()
+            cache_part = ""
+            if cache_creation_t or cache_read_t:
+                cache_part = (
+                    f" / +{cache_creation_t} cache_write"
+                    f" / +{cache_read_t} cache_read"
+                )
+            print(f"[axor] usage: +{in_t} in / +{out_t} out{cache_part} "
+                  f"tokens (total: {total})")
 
     def _execute_tool_governed(self, tool_name: str, request, handler: Callable) -> Any:
-        attempts   = self._tool_max_retries + 1
+        attempts = self._tool_max_retries + 1
         last_error: Exception | None = None
         t0 = time.monotonic()
 
@@ -778,7 +1467,6 @@ class _AxorGovernanceCore:
                     print(f"[axor] → {tool_name!r} error "
                           f"(attempt {attempt}/{attempts}): {exc}")
                 if attempt < attempts and self._tool_retry_delay > 0:
-                    # sync sleep — LangChain's wrap_tool_call is a sync hook
                     time.sleep(self._tool_retry_delay)
 
         latency_ms = (time.monotonic() - t0) * 1000
@@ -790,17 +1478,83 @@ class _AxorGovernanceCore:
             msg = self._tool_error_handler(tool_name, last_error)
             if self._verbose:
                 print(f"[axor] → {tool_name!r} handled error")
-            return msg
+            return _HandledError(msg) if isinstance(msg, str) else msg
 
         raise last_error
 
-    # ── public API ────────────────────────────────────────────────────────────
+    async def _aexecute_tool_governed(self, tool_name: str, request, handler: Callable) -> Any:
+        attempts = self._tool_max_retries + 1
+        last_error: Exception | None = None
+        t0 = time.monotonic()
+
+        for attempt in range(1, attempts + 1):
+            try:
+                result = await handler(request)
+                latency_ms = (time.monotonic() - t0) * 1000
+                if self._tool_stats:
+                    self._tool_stats.record_call(tool_name, latency_ms)
+                if self._verbose:
+                    print(f"[axor] → {tool_name!r} ok "
+                          f"(attempt {attempt}, {latency_ms:.0f}ms)")
+                return result
+            except Exception as exc:
+                last_error = exc
+                if self._verbose:
+                    print(f"[axor] → {tool_name!r} error "
+                          f"(attempt {attempt}/{attempts}): {exc}")
+                if attempt < attempts and self._tool_retry_delay > 0:
+                    await asyncio.sleep(self._tool_retry_delay)
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        if self._tool_stats:
+            self._tool_stats.record_call(tool_name, latency_ms)
+            self._tool_stats.record_error(tool_name)
+
+        if self._tool_error_handler is not None:
+            msg = self._tool_error_handler(tool_name, last_error)
+            if self._verbose:
+                print(f"[axor] → {tool_name!r} handled error")
+            return _HandledError(msg) if isinstance(msg, str) else msg
+
+        raise last_error
+
+    def _prepare_model_request(self, request):
+        self._ensure_engines()
+        self._turn += 1
+
+        tools = getattr(request, "tools", None) or []
+        filtered = self._filter_tools(tools)
+        if len(filtered) != len(tools):
+            request = request.override(tools=filtered)
+
+        request = self._merge_personality(request)
+        request = self._compress_via_axor_core(request)
+
+        # Tool relevance gating runs after compression so anchors derived
+        # from `messages` see compression's view of pending tool_calls.
+        if self._tool_selection == "relevance":
+            current_tools = getattr(request, "tools", None) or []
+            messages = list(getattr(request, "messages", []) or [])
+            signal = None
+            try:
+                signal = _classify_task_sync(_latest_human_text(messages))
+            except Exception:
+                signal = None
+            relevant = self._select_relevant_tools(current_tools, messages, signal)
+            if len(relevant) != len(current_tools):
+                request = request.override(tools=relevant)
+
+        self._enforce_hard_limit(request)
+        return request
 
     @property
     def total_tokens_spent(self) -> int:
-        if self._engines_ready:
-            return self._budget_tracker.total_tokens()
-        return 0
+        return self._budget_tracker.total_tokens() if self._engines_ready else 0
+
+    def cost_summary(self) -> dict | None:
+        if not self._engines_ready or self._token_cost_rates is None:
+            return None
+        return self._budget_tracker.cost_summary(self._token_cost_rates)
 
     @property
     def turns(self) -> int:
@@ -810,19 +1564,43 @@ class _AxorGovernanceCore:
     def tool_stats(self) -> ToolStats | None:
         return self._tool_stats
 
+    def cancel(self, reason: str = "user_abort") -> None:
+        """Signal cancellation. Safe to call from sync, async, or signal handler.
+
+        After cancel(), the next `wrap_model_call` / `wrap_tool_call`
+        invocation raises `AxorCancelledError` instead of dispatching to
+        the handler — terminating the agent run early.
+
+        Idempotent — repeated calls keep the original reason.
+        """
+        if not self._cancelled:
+            self._cancelled = True
+            self._cancel_reason = reason
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    def _check_cancel(self, where: str) -> None:
+        """Raise AxorCancelledError if cancellation has been requested.
+
+        Called at every model-call and tool-call boundary so a `cancel()`
+        in another thread or coroutine takes effect within one event step.
+        """
+        if self._cancelled:
+            raise AxorCancelledError(
+                f"axor: cancelled at {where} (reason={getattr(self, '_cancel_reason', 'user_abort')})"
+            )
+
     def reset(self) -> None:
         self._turn      = 0
         self._cancelled = False
+        self._cancel_reason = "user_abort"
         if self._tool_stats:
             self._tool_stats.reset()
-        # reset engines so next session gets a fresh context manager
-        self._ctx_manager    = None
         self._budget_tracker = None
         self._budget_engine  = None
         self._engines_ready  = False
-
-
-# ── LangChain AgentMiddleware subclass ────────────────────────────────────────
+        self._tool_selection_cache = None
 
 def _make_axor_middleware_class():
     from langchain.agents.middleware import (
@@ -831,49 +1609,54 @@ def _make_axor_middleware_class():
         ModelRequest,
         ModelResponse,
         ToolCallRequest,
-        hook_config,
     )
-    from langchain_core.messages import ToolMessage, SystemMessage
+    from langchain_core.messages import ToolMessage
     from langgraph.runtime import Runtime
+    from langgraph.types import Command
 
     class AxorMiddlewareImpl(_AxorGovernanceCore, AgentMiddleware):
+
+        # Adds `tool_result_cache` to LangGraph state for checkpointed memoization.
+        state_schema = AxorState
 
         def __init__(self, **kwargs) -> None:
             _AxorGovernanceCore.__init__(self, **kwargs)
             AgentMiddleware.__init__(self)
-
-        @hook_config(can_jump_to=["end"])
-        def before_model(
-            self,
-            state: AgentState,
-            runtime: Runtime,
-        ) -> dict[str, Any] | None:
-            if self._cancelled:
-                return {"jump_to": "end"}
-
-            messages = list(state.get("messages", []))
-            new_messages, changed = self._govern_messages_core(messages)
-
-            if self._cancelled:
-                return {"jump_to": "end"}
-
-            if changed:
-                return {"messages": new_messages}
-            return None
 
         def wrap_model_call(
             self,
             request: ModelRequest,
             handler: Callable[[ModelRequest], ModelResponse],
         ) -> ModelResponse:
-            # filter tools by policy
-            tools = getattr(request, "tools", None) or []
-            filtered = self._filter_tools(tools)
-            if len(filtered) != len(tools):
-                request = request.override(tools=filtered)
-
+            """
+            Single-hook pipeline:
+              1. Bail out if cancellation was requested.
+              2. Filter tools by allow/deny lists.
+              3. Merge `personality` into system_message.
+              4. Compress messages via axor-core ContextCompressor with
+                 FragmentValue-aware semantics (PINNED untouched, etc.)
+                 and CompressionMode picked from the latest task.
+              5. Hard-budget gate (raises BudgetExceededError when over).
+              6. Hand off to handler.
+              7. Record provider-counted input + output tokens.
+            """
+            self._check_cancel("wrap_model_call")
+            request = self._prepare_model_request(request)
+            self._check_cancel("wrap_model_call(post-prepare)")
             response = handler(request)
-            self._record_usage(response)
+            self._record_usage_from_response(response)
+            return response
+
+        async def awrap_model_call(
+            self,
+            request: ModelRequest,
+            handler: Callable[[ModelRequest], Any],
+        ) -> ModelResponse:
+            self._check_cancel("awrap_model_call")
+            request = self._prepare_model_request(request)
+            self._check_cancel("awrap_model_call(post-prepare)")
+            response = await handler(request)
+            self._record_usage_from_response(response)
             return response
 
         def wrap_tool_call(
@@ -881,38 +1664,172 @@ def _make_axor_middleware_class():
             request: ToolCallRequest,
             handler: Callable[[ToolCallRequest], Any],
         ) -> Any:
+            """
+            Tool result memoization via state["tool_result_cache"].
+
+            Same (tool_name, args) → same cached content. Across
+            invocations under the same `thread_id`, the cache survives
+            via LangGraph checkpointing (because we declared state_schema
+            = AxorState).
+
+            Errors are NOT cached — a transient failure shouldn't replay
+            forever; the next call should retry.
+
+            On cache miss, we return a Command bundling (a) the new
+            ToolMessage and (b) the state update with the cache entry.
+            On cache hit, we return a plain ToolMessage; no state update
+            needed (cache already contains this entry).
+            """
+            self._check_cancel("wrap_tool_call")
             tc        = request.tool_call if hasattr(request, "tool_call") else {}
             tool_name = _tool_name(tc)
             tc_id     = _tool_call_id(tc)
+            args      = (tc.get("args") if isinstance(tc, dict)
+                         else getattr(tc, "args", {}))
 
             if self._verbose:
-                args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
                 print(f"[axor] → tool {tool_name!r} args={args}")
+
+            state = getattr(request, "state", None) or {}
+            existing_cache = (
+                state.get("tool_result_cache") if isinstance(state, dict)
+                else getattr(state, "tool_result_cache", None)
+            ) or {}
+
+            cacheable = _is_tool_call_cacheable(tool_name, self._cache_tools)
+            cache_key = _hash_tool_call(tool_name, args) if cacheable else ""
+
+            if cacheable and cache_key in existing_cache:
+                if self._verbose:
+                    print(f"[axor] tool cache hit: {tool_name!r}")
+                if self._tool_stats:
+                    self._tool_stats.record_cache_hit(tool_name)
+                # Cache hits still add content to the next prompt budget.
+                cached_content = existing_cache[cache_key]
+                if self._engines_ready:
+                    self._budget_tracker.record(
+                        node_id=self._session_id,
+                        input_tokens=0, output_tokens=0,
+                        tool_tokens=max(len(cached_content) // 4, 1),
+                    )
+                return ToolMessage(
+                    content=cached_content,
+                    tool_call_id=tc_id or "",
+                )
 
             result = self._execute_tool_governed(tool_name, request, handler)
 
-            # wrap string error returns in ToolMessage
-            if isinstance(result, str) and self._tool_error_handler is not None:
-                return ToolMessage(content=result, tool_call_id=tc_id or "")
+            if isinstance(result, _HandledError):
+                return ToolMessage(content=str(result), tool_call_id=tc_id or "")
 
-            # record tool output size to budget tracker for accurate accounting
+            if isinstance(result, str):
+                out_text = result
+                msg = ToolMessage(content=result, tool_call_id=tc_id or "")
+            elif isinstance(result, ToolMessage):
+                content = result.content
+                out_text = content if isinstance(content, str) else str(content or "")
+                msg = result
+            else:
+                return result
+
             if self._engines_ready:
-                out_text = result if isinstance(result, str) else str(
-                    getattr(result, "content", "") or ""
-                )
                 self._budget_tracker.record(
                     node_id=self._session_id,
-                    input_tokens=0,
-                    output_tokens=0,
+                    input_tokens=0, output_tokens=0,
                     tool_tokens=max(len(out_text) // 4, 1),
                 )
-                # also feed result into ContextManager for next turn compression
-                self._ctx_manager.update(
-                    result_output=out_text[:2000],
-                    node_id=self._session_id,
+
+            if not cacheable:
+                return msg
+
+            new_cache = {**existing_cache, cache_key: out_text}
+
+            # FIFO eviction keeps checkpointed state bounded.
+            cap = self._max_tool_cache_entries
+            if cap is not None and len(new_cache) > cap:
+                for stale_key in list(new_cache.keys())[: len(new_cache) - cap]:
+                    del new_cache[stale_key]
+
+            return Command(update={
+                "messages": [msg],
+                "tool_result_cache": new_cache,
+            })
+
+        async def awrap_tool_call(
+            self,
+            request: ToolCallRequest,
+            handler: Callable[[ToolCallRequest], Any],
+        ) -> Any:
+            tc        = request.tool_call if hasattr(request, "tool_call") else {}
+            tool_name = _tool_name(tc)
+            tc_id     = _tool_call_id(tc)
+            args      = (tc.get("args") if isinstance(tc, dict)
+                         else getattr(tc, "args", {}))
+
+            if self._verbose:
+                print(f"[axor] → tool {tool_name!r} args={args}")
+
+            state = getattr(request, "state", None) or {}
+            existing_cache = (
+                state.get("tool_result_cache") if isinstance(state, dict)
+                else getattr(state, "tool_result_cache", None)
+            ) or {}
+
+            cacheable = _is_tool_call_cacheable(tool_name, self._cache_tools)
+            cache_key = _hash_tool_call(tool_name, args) if cacheable else ""
+
+            if cacheable and cache_key in existing_cache:
+                if self._verbose:
+                    print(f"[axor] tool cache hit: {tool_name!r}")
+                if self._tool_stats:
+                    self._tool_stats.record_cache_hit(tool_name)
+                cached_content = existing_cache[cache_key]
+                if self._engines_ready:
+                    self._budget_tracker.record(
+                        node_id=self._session_id,
+                        input_tokens=0, output_tokens=0,
+                        tool_tokens=max(len(cached_content) // 4, 1),
+                    )
+                return ToolMessage(
+                    content=cached_content,
+                    tool_call_id=tc_id or "",
                 )
 
-            return result
+            result = await self._aexecute_tool_governed(tool_name, request, handler)
+
+            if isinstance(result, _HandledError):
+                return ToolMessage(content=str(result), tool_call_id=tc_id or "")
+
+            if isinstance(result, str):
+                out_text = result
+                msg = ToolMessage(content=result, tool_call_id=tc_id or "")
+            elif isinstance(result, ToolMessage):
+                content = result.content
+                out_text = content if isinstance(content, str) else str(content or "")
+                msg = result
+            else:
+                return result
+
+            if self._engines_ready:
+                self._budget_tracker.record(
+                    node_id=self._session_id,
+                    input_tokens=0, output_tokens=0,
+                    tool_tokens=max(len(out_text) // 4, 1),
+                )
+
+            if not cacheable:
+                return msg
+
+            new_cache = {**existing_cache, cache_key: out_text}
+            cap = self._max_tool_cache_entries
+            if cap is not None and len(new_cache) > cap:
+                for stale_key in list(new_cache.keys())[: len(new_cache) - cap]:
+                    del new_cache[stale_key]
+
+            return Command(update={
+                "messages": [msg],
+                "tool_result_cache": new_cache,
+            })
 
         def after_agent(
             self,
@@ -923,7 +1840,6 @@ def _make_axor_middleware_class():
                 print(f"[axor] {self._tool_stats.summary()}")
             if self._verbose and self._engines_ready:
                 print(f"[axor] session total tokens: {self._budget_tracker.total_tokens()}")
-            # sync hook — memory save handled in aafter_agent
             return None
 
         async def aafter_agent(
@@ -950,16 +1866,18 @@ def _make_axor_middleware_class():
                             value=FragmentValue.WORKING,
                         )])
             except Exception as e:
-                if self._verbose:
-                    print(f"[axor] memory save failed: {e}")
+                # Memory persistence is best-effort — do NOT crash the agent
+                # run on a provider failure. But the previous behaviour
+                # (silent unless verbose) hid recurring failures from
+                # operators. Always log via the package logger AND surface
+                # to stderr so a degraded provider isn't invisible. Verbose
+                # callers also see it in their stdout stream.
+                _log.warning("memory save failed: %s", e, exc_info=True)
+                print(f"[axor] memory save failed: {e}", file=sys.stderr)
             return None
 
         async def _record_telemetry(self, state) -> None:
-            """
-            Classify the latest human message with axor-core's TaskAnalyzer
-            and forward one AnonymizedTraceRecord to the telemetry sink.
-            Silent no-op if telemetry is off or axor-core is not available.
-            """
+            """Forward one AnonymizedTraceRecord per agent run. Silent no-op when off."""
             if self._telemetry is None or not getattr(self._telemetry, "enabled", False):
                 return
             try:
@@ -983,43 +1901,49 @@ def _make_axor_middleware_class():
                     policy_adjusted=False,
                 )
             except Exception as e:
+                # Telemetry must never break the host; log via package logger
+                # and (if verbose) surface to stdout. Stderr fallback skipped —
+                # opt-in telemetry failing shouldn't pollute non-verbose output.
+                _log.warning("telemetry record failed: %s", e, exc_info=True)
                 if self._verbose:
                     print(f"[axor] telemetry record failed: {e}")
 
     AxorMiddlewareImpl.__name__ = "AxorMiddleware"
     return AxorMiddlewareImpl
 
-
-# ── Public AxorMiddleware ──────────────────────────────────────────────────────
-
 class AxorMiddleware(_AxorGovernanceCore):
     """
-    Governance middleware for LangChain 1.0 agents backed by axor-core engines.
+    Governance middleware for LangChain 1.0 agents.
 
-    When axor-core is installed, uses:
-      • ContextManager + ContextCompressor  — fragment-aware compression with
-        pinned/knowledge/working/ephemeral fragment semantics
-      • BudgetTracker + BudgetPolicyEngine  — accurate per-turn token accounting
-        with soft warnings and hard stops
+    What it does (in `wrap_model_call` order): filter tools, merge optional
+    personality into system_message, compress messages via axor-core's
+    FragmentValue-aware `ContextCompressor` (mode picked by `PolicySelector`
+    from the latest user task), gate against hard token limit, hand off
+    to the underlying handler, then record provider-counted token usage.
 
-    Falls back to built-in simple windowed compression when axor-core is absent.
+    `wrap_tool_call` adds optional tool-result memoization for tools listed
+    in `cache_tools`. The cache lives in `tool_result_cache` on the custom
+    `AxorState` and survives across `agent.invoke()` calls under the same
+    `thread_id` via LangGraph checkpointing.
+
+    Provider-side caching is delegated to
+    `langchain_anthropic.AnthropicPromptCachingMiddleware`; compose them
+    side by side. AxorMiddleware does not add `cache_control` markers.
 
     Parameters
     ----------
     soft_token_limit : int | None
         Advisory threshold — logs a warning when crossed.
     hard_token_limit : int | None
-        Hard stop — agent jumps to "end" when crossed.
-        Defaults to soft_token_limit * 1.5 when only soft is set.
-    compression_mode : str
-        "auto" | "minimal" | "moderate" | "broad"
-        Maps to axor-core AGGRESSIVE / BALANCED / LIGHT respectively.
+        Hard stop — raises `axor_core.errors.BudgetExceededError` when the
+        next call's projected input would exceed this. Defaults to
+        soft_token_limit * 1.5 when only soft is set.
     allowed_tools : list[str] | None
         Whitelist — only these tools reach the model.
     denied_tools : list[str] | None
         Blacklist — these tools are stripped from every model call.
     personality : str | None
-        Pinned system message — survives all compression.
+        Prepended to system_message verbatim.
     memory_provider : MemoryProvider | None
         axor-core memory provider for cross-session persistence.
     memory_namespace : str
@@ -1034,23 +1958,47 @@ class AxorMiddleware(_AxorGovernanceCore):
         Enable per-tool call/latency/error tracking (access via .tool_stats).
     verbose : bool
         Print governance decisions to stdout.
+    telemetry : str | None
+        "off" | "local" | "remote". Resolves from AXOR_TELEMETRY env if None.
+    cache_tools : list[str] | None
+        Tool names whose results may be memoized. Defaults to None because
+        LangChain tools may have side effects or return time-sensitive data.
+    token_cost_rates : axor_core.budget.TokenCostRates | None
+        Optional provider/model pricing. When set, `cost_summary()` returns
+        estimated money cost with prompt-cache write/read multipliers.
+    optimization_profile : str | None
+        Named compression preset. "cautious" favors quality and keeps the last
+        two tool results verbatim without tool relevance filtering.
+        "aggressive" favors cost with aggressive compression and relevance-based
+        tool schema trimming. Use `compression_mode="balanced"` as an explicit
+        override when you want moderate compression without a named profile.
+    recent_tools_window : int
+        Number of most recent ToolMessages kept verbatim before compression.
+        Lower values can save more tokens on large-output agents, but may
+        increase the risk of repeated tool calls. Defaults to the profile value
+        or 2 when no profile is set.
+    compression_mode : str | None
+        Optional override for policy-selected compression. Accepts "auto",
+        "aggressive"/"minimal", "balanced"/"moderate", or "light"/"broad".
 
     Examples
     --------
     Basic::
 
         axor = AxorMiddleware(soft_token_limit=80_000, verbose=True)
-        agent = create_agent("anthropic:claude-sonnet-4-5", tools=tools, middleware=[axor])
+        agent = create_agent("anthropic:claude-sonnet-4-6", tools=tools, middleware=[axor])
 
-    With retry and error handling::
+    Compose with Anthropic prompt caching (recommended)::
 
-        def on_err(name, exc): return f"Tool {name!r} failed: {exc}"
-        axor = AxorMiddleware(tool_max_retries=2, tool_error_handler=on_err)
-
-    Per-agent governance in LangGraph::
-
-        research = AxorMiddleware(allowed_tools=["search"], soft_token_limit=50_000)
-        writer   = AxorMiddleware(allowed_tools=["read", "write"], soft_token_limit=30_000)
+        from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
+        agent = create_agent(
+            "anthropic:claude-sonnet-4-6",
+            tools=tools,
+            middleware=[
+                AnthropicPromptCachingMiddleware(),
+                AxorMiddleware(soft_token_limit=80_000),
+            ],
+        )
     """
 
     _impl_class = None
@@ -1064,8 +2012,6 @@ class AxorMiddleware(_AxorGovernanceCore):
 
         if cls._impl_class is not None:
             instance = object.__new__(cls._impl_class)
-            # Python skips __init__ when __new__ returns a different type,
-            # so we must initialize explicitly
             cls._impl_class.__init__(instance, **kwargs)
             return instance
         return object.__new__(cls)
@@ -1074,8 +2020,6 @@ class AxorMiddleware(_AxorGovernanceCore):
         self,
         soft_token_limit: int | None = None,
         hard_token_limit: int | None = None,
-        compression_mode: str = "auto",
-        bypass_token_threshold: int | None = None,
         allowed_tools: list[str] | None = None,
         denied_tools:  list[str] | None = None,
         personality:   str | None = None,
@@ -1087,17 +2031,25 @@ class AxorMiddleware(_AxorGovernanceCore):
         track_tool_stats: bool = False,
         verbose: bool = False,
         telemetry: str | None = None,
+        cache_tools: list[str] | None = None,
+        max_tool_cache_entries: int | None = 100,
+        recent_tools_window: int | None = None,
+        compression_mode: str | None = None,
+        optimization_profile: str | None = None,
+        tool_selection: str | None = None,
+        tool_top_k: int | None = None,
+        tool_min_keep: int = 3,
+        tool_sticky_lookback: int = 4,
+        tool_dedup_old_results: bool | None = None,
+        tool_selection_stable: bool = True,
+        token_cost_rates: Any | None = None,
     ) -> None:
-        # Guard against double init — __new__ already called __init__
-        # on AxorMiddlewareImpl instances
         if getattr(self, "_engines_ready", None) is not None:
             return
         _AxorGovernanceCore.__init__(
             self,
             soft_token_limit=soft_token_limit,
             hard_token_limit=hard_token_limit,
-            compression_mode=compression_mode,
-            bypass_token_threshold=bypass_token_threshold,
             allowed_tools=allowed_tools,
             denied_tools=denied_tools,
             personality=personality,
@@ -1109,4 +2061,16 @@ class AxorMiddleware(_AxorGovernanceCore):
             track_tool_stats=track_tool_stats,
             verbose=verbose,
             telemetry=telemetry,
+            cache_tools=cache_tools,
+            max_tool_cache_entries=max_tool_cache_entries,
+            recent_tools_window=recent_tools_window,
+            compression_mode=compression_mode,
+            optimization_profile=optimization_profile,
+            tool_selection=tool_selection,
+            tool_top_k=tool_top_k,
+            tool_min_keep=tool_min_keep,
+            tool_sticky_lookback=tool_sticky_lookback,
+            tool_dedup_old_results=tool_dedup_old_results,
+            tool_selection_stable=tool_selection_stable,
+            token_cost_rates=token_cost_rates,
         )
