@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0 — 2026-05-04
+
+### Added
+- Per-run tool-selection telemetry. `_prepare_model_request` snapshots
+  `mode` (`"none"`/`"relevance"`), `offered`, `kept`, `dropped_relevance`,
+  and `dropped_denied`; `_record_telemetry` forwards the snapshot via
+  the new `record_decision(tool_selection=...)` kwarg. Snapshot resets on
+  successful enqueue and inside `reset()`.
+- README link to the [`axor-core`](https://github.com/Bucha11/axor-core)
+  repo from the intro and Requirements section.
+
+### Changed
+- `[telemetry]` extra pin bumped to `axor-telemetry>=0.3.0,<0.4` —
+  the new `tool_selection` kwarg requires the matching wire-format
+  field.
+
 ## 0.4.0 — 2026-04-29
 
 ### Added
