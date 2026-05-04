@@ -110,3 +110,77 @@ def test_record_telemetry_noop_when_off(_isolate_home):
     state = {"messages": []}
     asyncio.run(mw._record_telemetry(state))
     assert not (_isolate_home / "queue.jsonl").exists()
+
+
+def test_record_telemetry_includes_tool_selection_snapshot(monkeypatch, _isolate_home):
+    """A captured tool-selection snapshot is forwarded to the wire payload."""
+    monkeypatch.setenv("AXOR_TELEMETRY", "local")
+    from langchain_core.messages import AIMessage, HumanMessage
+    from axor_langchain import AxorMiddleware
+
+    mw = AxorMiddleware()
+    mw._tool_selection_snapshot = {
+        "mode":              "relevance",
+        "offered":           7,
+        "kept":              3,
+        "dropped_relevance": 3,
+        "dropped_denied":    1,
+    }
+    state = {"messages": [
+        HumanMessage(content="describe the database schema"),
+        AIMessage(content="Sure..."),
+    ]}
+    asyncio.run(mw._record_telemetry(state))
+
+    import json
+    rec = json.loads((_isolate_home / "queue.jsonl").read_text().splitlines()[0])
+    assert rec["tool_selection"] == {
+        "mode":              "relevance",
+        "offered":           7,
+        "kept":              3,
+        "dropped_relevance": 3,
+        "dropped_denied":    1,
+    }
+    # Snapshot is reset after a successful record so the next run starts fresh.
+    assert mw._tool_selection_snapshot is None
+
+
+def test_prepare_model_request_captures_tool_selection_snapshot(monkeypatch):
+    """`_prepare_model_request` populates a snapshot reflecting deny-list drops."""
+    monkeypatch.setenv("AXOR_TELEMETRY", "off")
+    from langchain_core.messages import HumanMessage
+    from axor_langchain import AxorMiddleware
+
+    mw = AxorMiddleware(denied_tools=["dangerous_tool"], telemetry="off")
+
+    class _FakeRequest:
+        def __init__(self):
+            self.messages = [HumanMessage(content="read some data")]
+            self.tools = [
+                _FakeTool("safe_tool"),
+                _FakeTool("dangerous_tool"),
+                _FakeTool("read_data"),
+            ]
+            self.system_message = None
+            self.model = "test"
+            self.runnable_config = None
+            self.state = {}
+        def override(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+            return self
+
+    class _FakeTool:
+        def __init__(self, name):
+            self.name = name
+            self.description = ""
+
+    request = _FakeRequest()
+    mw._prepare_model_request(request)
+    snap = mw._tool_selection_snapshot
+    assert snap is not None
+    assert snap["mode"] == "none"
+    assert snap["offered"] == 3
+    assert snap["dropped_denied"] == 1
+    assert snap["dropped_relevance"] == 0
+    assert snap["kept"] == 2

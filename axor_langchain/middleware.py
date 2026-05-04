@@ -1020,6 +1020,10 @@ class _AxorGovernanceCore:
         # schema in the cached prefix and dropping the cache hit.
         self._tool_selection_stable = bool(tool_selection_stable)
         self._tool_selection_cache: tuple | None = None
+        # Per-run snapshot of the tool-selection outcome for telemetry. Captured
+        # on the first wrap_model_call of an agent run; reset after the
+        # telemetry record is emitted in `_record_telemetry`.
+        self._tool_selection_snapshot: dict | None = None
         # Bound checkpointed tool cache; None means caller accepts unbounded state.
         self._max_tool_cache_entries = max_tool_cache_entries
         self._token_cost_rates = token_cost_rates
@@ -1523,8 +1527,10 @@ class _AxorGovernanceCore:
         self._turn += 1
 
         tools = getattr(request, "tools", None) or []
+        offered_count = len(tools)
         filtered = self._filter_tools(tools)
-        if len(filtered) != len(tools):
+        dropped_denied = offered_count - len(filtered)
+        if dropped_denied:
             request = request.override(tools=filtered)
 
         request = self._merge_personality(request)
@@ -1532,6 +1538,8 @@ class _AxorGovernanceCore:
 
         # Tool relevance gating runs after compression so anchors derived
         # from `messages` see compression's view of pending tool_calls.
+        kept_count = len(filtered)
+        dropped_relevance = 0
         if self._tool_selection == "relevance":
             current_tools = getattr(request, "tools", None) or []
             messages = list(getattr(request, "messages", []) or [])
@@ -1541,8 +1549,24 @@ class _AxorGovernanceCore:
             except Exception:
                 signal = None
             relevant = self._select_relevant_tools(current_tools, messages, signal)
-            if len(relevant) != len(current_tools):
+            dropped_relevance = len(current_tools) - len(relevant)
+            kept_count = len(relevant)
+            if dropped_relevance:
                 request = request.override(tools=relevant)
+
+        # Snapshot the tool-selection outcome for telemetry. We overwrite
+        # each turn rather than guarding on first-call because relevance
+        # caching + static allow/deny lists make the numbers stable across
+        # turns within a run, and overwrite is robust to runs that share a
+        # middleware instance without telemetry-driven reset.
+        if offered_count > 0:
+            self._tool_selection_snapshot = {
+                "mode":              self._tool_selection or "none",
+                "offered":           offered_count,
+                "kept":              kept_count,
+                "dropped_relevance": dropped_relevance,
+                "dropped_denied":    dropped_denied,
+            }
 
         self._enforce_hard_limit(request)
         return request
@@ -1601,6 +1625,7 @@ class _AxorGovernanceCore:
         self._budget_engine  = None
         self._engines_ready  = False
         self._tool_selection_cache = None
+        self._tool_selection_snapshot = None
 
 def _make_axor_middleware_class():
     from langchain.agents.middleware import (
@@ -1892,6 +1917,7 @@ def _make_axor_middleware_class():
                 analyzer = TaskAnalyzer()
                 signal, event = await analyzer.analyze(human)
                 tokens = self._budget_tracker.total_tokens() if self._engines_ready else 0
+                tool_selection = self._tool_selection_snapshot
                 await self._telemetry.record_decision(
                     raw_input=human,
                     signal=signal,
@@ -1899,7 +1925,12 @@ def _make_axor_middleware_class():
                     confidence=float(event.confidence),
                     tokens_spent=int(tokens),
                     policy_adjusted=False,
+                    tool_selection=tool_selection,
                 )
+                # Reset only after a successful enqueue — if record_decision
+                # failed earlier, the caller's `except` already swallowed it
+                # and the next run will report fresh stats.
+                self._tool_selection_snapshot = None
             except Exception as e:
                 # Telemetry must never break the host; log via package logger
                 # and (if verbose) surface to stdout. Stderr fallback skipped —
