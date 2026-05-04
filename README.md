@@ -13,6 +13,10 @@ enforces token budgets, filters tools, and optionally caches deterministic tool
 results. Add it to `create_agent()` as middleware and keep your existing tools,
 models, prompts, and LangGraph topology.
 
+Curious what runs under the hood? The governance kernel lives in
+[axor-core](https://github.com/Bucha11/axor-core) — compression strategies,
+policy selection, budget tracking, and the rest of the moving parts.
+
 Validated on live hard-agent benchmarks:
 
 - OpenAI aggressive: **77.0% aggregate cost savings**, **0.91 average judge score** (3-run average)
@@ -362,7 +366,7 @@ Recommended rollout path:
 - Python 3.11+
 - `langchain >= 1.0.0`
 - `langgraph >= 1.0.0`
-- `axor-core`
+- [`axor-core`](https://github.com/Bucha11/axor-core)
 
 ## License
 
