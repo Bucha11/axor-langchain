@@ -366,7 +366,24 @@ Recommended rollout path:
 - Python 3.11+
 - `langchain >= 1.0.0`
 - `langgraph >= 1.0.0`
-- [`axor-core`](https://github.com/Bucha11/axor-core)
+- [`axor-core`](https://github.com/Bucha11/axor-core) >= 0.5.0
+
+---
+
+## Ecosystem
+
+| Package | Role |
+|---------|------|
+| [`axor-core`](https://github.com/Bucha11/axor-core) | Governance kernel |
+| [`axor-claude`](https://github.com/Bucha11/axor-claude) | Claude / Claude Code adapter |
+| [`axor-classifier-simple`](https://github.com/Bucha11/axor-classifier-simple) | ML task signal derivation (optional) |
+| [`axor-classifier-llm`](https://github.com/Bucha11/axor-classifier-llm) | LLM verifier for gray-zone escalation (optional) |
+| [`axor-memory-sqlite`](https://github.com/Bucha11/axor-memory-sqlite) | Cross-session memory — `AxorMiddleware(memory_provider=...)` |
+| [`axor-telemetry`](https://github.com/Bucha11/axor-telemetry) | Privacy-preserving governance feedback (optional) |
+| [`axor-cli`](https://github.com/Bucha11/axor-cli) | Governed terminal runtime |
+| [`axor-benchmarks`](https://github.com/Bucha11/axor-benchmarks) | Governance proof layer |
+
+---
 
 ## License
 

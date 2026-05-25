@@ -1036,6 +1036,7 @@ class _AxorGovernanceCore:
         import uuid as _uuid
         self._session_id  = f"lc-{_uuid.uuid4().hex[:12]}"
         self._tool_stats  = ToolStats() if track_tool_stats else None
+        self._wrap_tools_called = False
 
         self._budget_tracker: Any = None
         self._budget_engine:  Any = None
@@ -1627,6 +1628,47 @@ class _AxorGovernanceCore:
         self._tool_selection_cache = None
         self._tool_selection_snapshot = None
 
+    def wrap_tools(self, tools: list, policy_fn: Callable | None = None) -> list:
+        """
+        Wrap a list of LangChain tools in AxorToolWrapper for governance enforcement.
+
+        Returns a new list where each tool is wrapped so that policy evaluation
+        happens before the original tool's _run/_arun is called.
+
+        If policy_fn is not provided, a default policy derived from this
+        middleware's allowed_tools/denied_tools configuration is used.
+
+        NOTE: AxorCallbackHandler provides observability only — use wrap_tools()
+        for enforcement. Callback-only integration does not intercept tool execution.
+        """
+        from axor_langchain.wrapper import AxorToolWrapper
+        self._wrap_tools_called = True
+
+        if policy_fn is None:
+            allowed = self._allowed_tools
+            denied = self._denied_tools
+
+            def _default_policy(normalized):
+                tool = getattr(normalized, "tool", "")
+                if allowed is not None and tool not in allowed:
+                    return f"tool '{tool}' not in allowed_tools"
+                if tool in denied:
+                    return f"tool '{tool}' is explicitly denied"
+                return None
+
+            policy_fn = _default_policy
+
+        return [AxorToolWrapper(tool=t, policy_fn=policy_fn) for t in tools]
+
+    def _warn_callback_only_once(self) -> None:
+        """Warn once when wrap_tool_call is used without wrap_tools — callback-only mode."""
+        if not self._wrap_tools_called:
+            _log.warning(
+                "AxorCallbackHandler provides observability only — "
+                "use AxorToolWrapper for enforcement"
+            )
+            self._wrap_tools_called = True  # warn only once per session
+
 def _make_axor_middleware_class():
     from langchain.agents.middleware import (
         AgentMiddleware,
@@ -1706,6 +1748,7 @@ def _make_axor_middleware_class():
             needed (cache already contains this entry).
             """
             self._check_cancel("wrap_tool_call")
+            self._warn_callback_only_once()
             tc        = request.tool_call if hasattr(request, "tool_call") else {}
             tool_name = _tool_name(tc)
             tc_id     = _tool_call_id(tc)

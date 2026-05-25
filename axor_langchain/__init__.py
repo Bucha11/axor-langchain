@@ -13,13 +13,16 @@ from axor_langchain.middleware import (
     ToolCallStats,
     ToolStats,
 )
+from axor_langchain.wrapper import AxorToolWrapper
+from axor_langchain._version import get_version
 
-__version__ = "0.4.0"
+__version__ = get_version("axor-langchain")
 
 __all__ = [
     "AxorCancelledError",
     "AxorMiddleware",
     "AxorState",
+    "AxorToolWrapper",
     "JudgeResult",
     "ToolCallStats",
     "ToolStats",
