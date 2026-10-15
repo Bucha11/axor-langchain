@@ -86,29 +86,8 @@ def test_wrap_tools_sets_flag():
     assert m._wrap_tools_called
 
 
-def test_callback_only_warning_emitted(caplog):
-    """_warn_callback_only_once() emits warning when wrappers not used."""
+def test_wrapped_tools_share_the_middleware_gate():
+    """wrap_tools() hands every wrapper the middleware's one kernel gate (one ledger)."""
     m = _middleware()
-    with caplog.at_level(logging.WARNING, logger="axor.langchain"):
-        m._warn_callback_only_once()
-    assert any("observability only" in msg.lower() for msg in caplog.messages)
-
-
-def test_callback_only_warning_emitted_only_once(caplog):
-    """Warning fires at most once per session."""
-    m = _middleware()
-    with caplog.at_level(logging.WARNING, logger="axor.langchain"):
-        m._warn_callback_only_once()
-        m._warn_callback_only_once()
-    warning_msgs = [msg for msg in caplog.messages if "observability only" in msg.lower()]
-    assert len(warning_msgs) == 1
-
-
-def test_callback_only_warning_suppressed_after_wrap_tools(caplog):
-    """No warning when wrap_tools() was already called."""
-    m = _middleware()
-    m.wrap_tools([_SimpleTool()])
-    with caplog.at_level(logging.WARNING, logger="axor.langchain"):
-        m._warn_callback_only_once()
-    warning_msgs = [msg for msg in caplog.messages if "observability only" in msg.lower()]
-    assert len(warning_msgs) == 0
+    wrapped = m.wrap_tools([_SimpleTool(), _SimpleTool()])
+    assert all(w._gate is m._tool_gate for w in wrapped)

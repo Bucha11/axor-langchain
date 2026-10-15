@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — kernel gate
+
+### Changed
+- `AxorMiddleware.wrap_tool_call` / `awrap_tool_call` and `AxorToolWrapper` now decide
+  every tool call with the current kernel (`ToolCallGovernor`, axor-core
+  `claude/model-m1`) before the tool runs: `AxorMiddleware(governance=..., confirmer=...)`.
+  The tool runs on the arguments the kernel resolved; its output is registered and
+  returned with references for hidden values. The request is seeded from the human
+  messages. Before this, governance was a 68-line normalizer and an optional
+  `policy_fn`; nothing reached a kernel gate.
+- `wrap_tools()` wrappers share the middleware's gate and are decided once.
+
+### Fixed
+- `AxorToolWrapper` called the wrapped tool's `_run` directly, which fails for
+  `StructuredTool` (`@tool`) in langchain 1.x; it now uses `invoke` / `ainvoke`.
+
 ## 0.5.0 — 2026-05-04
 
 ### Added

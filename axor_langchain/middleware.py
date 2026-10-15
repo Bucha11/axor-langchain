@@ -954,7 +954,16 @@ class _AxorGovernanceCore:
         tool_dedup_old_results: bool | None = None,
         tool_selection_stable: bool = True,
         token_cost_rates: Any | None = None,
+        governance: Any = None,
+        confirmer: Any = None,
+        structured: Any = None,
+        tool_gate: Any = None,
     ) -> None:
+        from axor_langchain.governed import ToolGate
+        # Every tool call is decided by the current kernel before it runs (an empty
+        # configuration still runs the gate and its ledger).
+        self._tool_gate = tool_gate if tool_gate is not None else ToolGate.from_config(
+            governance, confirmer=confirmer, structured=structured)
         profile = _normalize_optimization_profile(optimization_profile)
         profile_cfg = _OPTIMIZATION_PROFILES.get(profile or "", {})
         effective_recent_tools_window = (
@@ -1451,6 +1460,41 @@ class _AxorGovernanceCore:
             print(f"[axor] usage: +{in_t} in / +{out_t} out{cache_part} "
                   f"tokens (total: {total})")
 
+    def _gate_request(self, request, tool_name: str, args: Any, tc_id: str):
+        """The kernel gate before the tool runs: ``(request to run, Admitted)``, or the
+        refusal text. A tool wrapped by ``wrap_tools`` with this gate is decided by its
+        wrapper: ``(request, None)``."""
+        from axor_langchain.governed import Admitted
+        gate = self._tool_gate
+        gate.observe_state(getattr(request, "state", None) or {})
+        if getattr(getattr(request, "tool", None), "_gate", None) is gate:
+            return request, None
+        verdict = gate.check(tool_name, args if isinstance(args, dict) else {}, tc_id or None)
+        if not isinstance(verdict, Admitted):
+            if self._tool_stats:
+                self._tool_stats.record_denied(tool_name)
+            if self._verbose:
+                print(f"[axor] → {tool_name!r} denied ({verdict.category}): {verdict.reason}")
+            return verdict.message()
+        if verdict.args != (args or {}):  # MODEL.md 9: the tool runs on resolved references
+            request = request.override(tool_call={**request.tool_call, "args": verdict.args})
+        return request, verdict
+
+    def _gate_result(self, adm, tool_name: str, result: Any) -> Any:
+        """Register what the tool returned; return it as the agent may see it."""
+        if adm is None:
+            return result
+        if isinstance(result, _HandledError):
+            self._tool_gate.fail(adm)
+            return result
+        from langchain_core.messages import ToolMessage
+        if isinstance(result, ToolMessage) and isinstance(result.content, str):
+            view = self._tool_gate.finish(adm, tool_name, result.content)
+            return result if view == result.content else result.model_copy(update={"content": view})
+        # a non-text result (a Command, a content-block list) is registered as its repr
+        view = self._tool_gate.finish(adm, tool_name, result)
+        return view if isinstance(result, str) else result
+
     def _execute_tool_governed(self, tool_name: str, request, handler: Callable) -> Any:
         attempts = self._tool_max_retries + 1
         last_error: Exception | None = None
@@ -1638,8 +1682,9 @@ class _AxorGovernanceCore:
         If policy_fn is not provided, a default policy derived from this
         middleware's allowed_tools/denied_tools configuration is used.
 
-        NOTE: AxorCallbackHandler provides observability only — use wrap_tools()
-        for enforcement. Callback-only integration does not intercept tool execution.
+        The wrappers share this middleware's kernel gate; a call through a
+        wrapped tool is decided once (by the wrapper), not again by
+        ``wrap_tool_call``.
         """
         from axor_langchain.wrapper import AxorToolWrapper
         self._wrap_tools_called = True
@@ -1658,16 +1703,7 @@ class _AxorGovernanceCore:
 
             policy_fn = _default_policy
 
-        return [AxorToolWrapper(tool=t, policy_fn=policy_fn) for t in tools]
-
-    def _warn_callback_only_once(self) -> None:
-        """Warn once when wrap_tool_call is used without wrap_tools — callback-only mode."""
-        if not self._wrap_tools_called:
-            _log.warning(
-                "AxorCallbackHandler provides observability only — "
-                "use AxorToolWrapper for enforcement"
-            )
-            self._wrap_tools_called = True  # warn only once per session
+        return [AxorToolWrapper(tool=t, policy_fn=policy_fn, gate=self._tool_gate) for t in tools]
 
 def _make_axor_middleware_class():
     from langchain.agents.middleware import (
@@ -1748,7 +1784,6 @@ def _make_axor_middleware_class():
             needed (cache already contains this entry).
             """
             self._check_cancel("wrap_tool_call")
-            self._warn_callback_only_once()
             tc        = request.tool_call if hasattr(request, "tool_call") else {}
             tool_name = _tool_name(tc)
             tc_id     = _tool_call_id(tc)
@@ -1757,6 +1792,11 @@ def _make_axor_middleware_class():
 
             if self._verbose:
                 print(f"[axor] → tool {tool_name!r} args={args}")
+
+            gated = self._gate_request(request, tool_name, args, tc_id)
+            if isinstance(gated, str):
+                return ToolMessage(content=gated, tool_call_id=tc_id or "", status="error")
+            request, adm = gated
 
             state = getattr(request, "state", None) or {}
             existing_cache = (
@@ -1767,7 +1807,8 @@ def _make_axor_middleware_class():
             cacheable = _is_tool_call_cacheable(tool_name, self._cache_tools)
             cache_key = _hash_tool_call(tool_name, args) if cacheable else ""
 
-            if cacheable and cache_key in existing_cache:
+            # a call that spends a grant use always runs (a cache hit is no execution)
+            if cacheable and cache_key in existing_cache and getattr(adm, "spend", None) is None:
                 if self._verbose:
                     print(f"[axor] tool cache hit: {tool_name!r}")
                 if self._tool_stats:
@@ -1785,7 +1826,13 @@ def _make_axor_middleware_class():
                     tool_call_id=tc_id or "",
                 )
 
-            result = self._execute_tool_governed(tool_name, request, handler)
+            try:
+                result = self._execute_tool_governed(tool_name, request, handler)
+            except BaseException:
+                if adm is not None:
+                    self._tool_gate.fail(adm)
+                raise
+            result = self._gate_result(adm, tool_name, result)
 
             if isinstance(result, _HandledError):
                 return ToolMessage(content=str(result), tool_call_id=tc_id or "")
@@ -1837,6 +1884,11 @@ def _make_axor_middleware_class():
             if self._verbose:
                 print(f"[axor] → tool {tool_name!r} args={args}")
 
+            gated = self._gate_request(request, tool_name, args, tc_id)
+            if isinstance(gated, str):
+                return ToolMessage(content=gated, tool_call_id=tc_id or "", status="error")
+            request, adm = gated
+
             state = getattr(request, "state", None) or {}
             existing_cache = (
                 state.get("tool_result_cache") if isinstance(state, dict)
@@ -1846,7 +1898,8 @@ def _make_axor_middleware_class():
             cacheable = _is_tool_call_cacheable(tool_name, self._cache_tools)
             cache_key = _hash_tool_call(tool_name, args) if cacheable else ""
 
-            if cacheable and cache_key in existing_cache:
+            # a call that spends a grant use always runs (a cache hit is no execution)
+            if cacheable and cache_key in existing_cache and getattr(adm, "spend", None) is None:
                 if self._verbose:
                     print(f"[axor] tool cache hit: {tool_name!r}")
                 if self._tool_stats:
@@ -1863,7 +1916,13 @@ def _make_axor_middleware_class():
                     tool_call_id=tc_id or "",
                 )
 
-            result = await self._aexecute_tool_governed(tool_name, request, handler)
+            try:
+                result = await self._aexecute_tool_governed(tool_name, request, handler)
+            except BaseException:
+                if adm is not None:
+                    self._tool_gate.fail(adm)
+                raise
+            result = self._gate_result(adm, tool_name, result)
 
             if isinstance(result, _HandledError):
                 return ToolMessage(content=str(result), tool_call_id=tc_id or "")
@@ -2117,6 +2176,10 @@ class AxorMiddleware(_AxorGovernanceCore):
         tool_dedup_old_results: bool | None = None,
         tool_selection_stable: bool = True,
         token_cost_rates: Any | None = None,
+        governance: Any = None,
+        confirmer: Any = None,
+        structured: Any = None,
+        tool_gate: Any = None,
     ) -> None:
         if getattr(self, "_engines_ready", None) is not None:
             return
@@ -2147,4 +2210,8 @@ class AxorMiddleware(_AxorGovernanceCore):
             tool_dedup_old_results=tool_dedup_old_results,
             tool_selection_stable=tool_selection_stable,
             token_cost_rates=token_cost_rates,
+            governance=governance,
+            confirmer=confirmer,
+            structured=structured,
+            tool_gate=tool_gate,
         )

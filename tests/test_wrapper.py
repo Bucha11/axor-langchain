@@ -124,17 +124,16 @@ async def test_async_allow_calls_original_tool():
     assert recording_tool.called
 
 
-# ── (5) callback-only mode logs observability-only warning ─────────────────────
+# ── (5) no policy_fn: the kernel gate still decides ────────────────────────────
 
-def test_no_policy_fn_logs_warning(caplog):
-    """Creating a wrapper without policy_fn must log an observability-only warning."""
+def test_no_shared_gate_logs_warning_and_still_gates(caplog):
+    """Without policy_fn the call still goes through the kernel gate; without a shared
+    gate the wrapper says its ledger is its own."""
     from axor_langchain.wrapper import AxorToolWrapper
     with caplog.at_level(logging.WARNING, logger="axor.langchain.wrapper"):
         wrapper = AxorToolWrapper(tool=_RecordingTool(), policy_fn=None)
-    assert any("observability only" in msg.lower() for msg in caplog.messages), (
-        f"Expected observability-only warning, got: {caplog.messages}"
-    )
-    assert any("pass policy_fn for enforcement" in msg for msg in caplog.messages)
+    assert any("without a shared gate" in msg for msg in caplog.messages)
+    assert wrapper._run() == "tool_executed"
 
 
 def test_async_policy_fn_rejected():

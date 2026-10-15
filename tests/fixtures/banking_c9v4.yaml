@@ -1,0 +1,151 @@
+mode: production
+untrusted_sources:
+- get_balance
+- get_iban
+- get_most_recent_transactions
+- get_scheduled_transactions
+- get_user_info
+- read_file
+sensitive_sources:
+- get_balance
+- get_iban
+- get_most_recent_transactions
+- get_scheduled_transactions
+- get_user_info
+- read_file
+egress_sinks:
+- schedule_transaction
+- send_money
+- update_scheduled_transaction
+integrity_sinks:
+- update_password
+- update_user_info
+access_control_sinks:
+- update_password
+driving_args:
+  schedule_transaction:
+  - amount
+  - recipient
+  send_money:
+  - amount
+  - recipient
+  update_password:
+  - password
+  update_scheduled_transaction:
+  - amount
+  - id
+  - recipient
+  update_user_info: []
+consequence_overrides:
+  get_balance: benign
+  get_iban: benign
+  get_most_recent_transactions: benign
+  get_scheduled_transactions: benign
+  get_user_info: benign
+  read_file: benign
+  schedule_transaction: consequential
+  send_money: consequential
+  update_password: catastrophic
+  update_scheduled_transaction: consequential
+  update_user_info: consequential
+max_unattended_consequence: reversible
+operator_sets:
+  schedule_transaction:
+    recipient: &id001
+    - CH9300762011623852957
+    - GB29NWBK60161331926819
+    - SE3550000000054910000003
+    - US122000000121212121212
+  send_money:
+    recipient: *id001
+  update_password:
+    password: []
+  update_scheduled_transaction:
+    id:
+    - '6'
+    - '7'
+    recipient: *id001
+operator_sets_refuse_above: benign
+floor_scope: all_mutating
+floor_mode: audience
+audience:
+- '6'
+- '7'
+- CH9300762011623852957
+- DE89370400440532013000
+- GB29NWBK60161331926819
+- SE3550000000054910000003
+- US122000000121212121212
+own_names:
+- address-change.txt
+- bill-december-2023.txt
+- landlord-notices.txt
+destination_args:
+  schedule_transaction:
+  - recipient
+  send_money:
+  - recipient
+  update_scheduled_transaction:
+  - recipient
+content_args:
+  schedule_transaction:
+  - subject
+  send_money:
+  - subject
+  update_password: []
+  update_scheduled_transaction:
+  - subject
+  update_user_info: []
+consequence_rules:
+  schedule_transaction:
+    magnitude:
+      arg: amount
+      above: 1100.0
+      class: catastrophic
+  send_money:
+    magnitude:
+      arg: amount
+      above: 1100.0
+      class: catastrophic
+  update_scheduled_transaction:
+    magnitude:
+      arg: amount
+      above: 1100.0
+      class: catastrophic
+  update_user_info:
+    own: reversible
+template_limits:
+  send_money:
+    amount: 1100.0
+  schedule_transaction:
+    amount: 1100.0
+  update_scheduled_transaction:
+    amount: 1100.0
+operator_sets_confirm: true
+fallback_to_confirmation: true
+references: true
+secret_fields:
+- password
+sender_aliases: {}
+no_sender_tools:
+- read_file
+integrity_default: context
+integrity_origins: request-only
+grant_args:
+  schedule_transaction:
+    amount: money
+    recipient: iban
+  send_money:
+    amount: money
+    recipient: iban
+  update_password:
+    password: string
+  update_scheduled_transaction:
+    amount: money?
+    id: number
+    recipient: iban?
+grant_quotas: {}
+content_projection: true
+l1_by_clause: true
+description_sources: {}
+description_targets: {}

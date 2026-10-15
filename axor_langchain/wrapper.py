@@ -10,9 +10,9 @@ from axor_langchain.normalizer import LangChainNormalizer
 
 _log = logging.getLogger("axor.langchain.wrapper")
 
-_OBSERVABILITY_ONLY_WARNING = (
-    "AxorToolWrapper provides observability only — "
-    "pass policy_fn for enforcement"
+_OWN_GATE_WARNING = (
+    "AxorToolWrapper without a shared gate: this tool is gated under an empty "
+    "configuration with a ledger of its own — pass gate= (AxorMiddleware.wrap_tools does)"
 )
 
 
@@ -36,20 +36,31 @@ def _make_tool_class():
         observability_callback: optional — called after policy evaluation with
             (tool_name, normalized_intent, denial_reason | None). Does not
             affect enforcement.
+
+        gate: the agent session's ``ToolGate`` (``AxorMiddleware.wrap_tools``
+            passes its own). After ``policy_fn`` every call is decided by the
+            current kernel, the tool runs on the arguments it resolved and its
+            output is registered; without one the wrapper gates under an empty
+            configuration with a ledger of its own (no request: call
+            ``wrapper._gate.request(task)``).
         """
 
         _wrapped: Any = PrivateAttr()
         _policy_fn: Any = PrivateAttr()
         _normalizer: LangChainNormalizer = PrivateAttr()
         _obs_callback: Any = PrivateAttr()
+        _gate: Any = PrivateAttr()
 
         def __init__(
             self,
             tool: BaseTool,
             policy_fn: Callable | None = None,
             observability_callback: Callable | None = None,
+            gate: Any = None,
             **kwargs: Any,
         ) -> None:
+            if getattr(tool, "args_schema", None) is not None:
+                kwargs.setdefault("args_schema", tool.args_schema)
             super().__init__(
                 name=tool.name,
                 description=tool.description or "",
@@ -59,10 +70,13 @@ def _make_tool_class():
             self._policy_fn = policy_fn
             self._normalizer = LangChainNormalizer()
             self._obs_callback = observability_callback
+            if gate is None:
+                from axor_langchain.governed import ToolGate
+                _log.warning(_OWN_GATE_WARNING)
+                gate = ToolGate.from_config()
+            self._gate = gate
 
-            if policy_fn is None:
-                _log.warning(_OBSERVABILITY_ONLY_WARNING)
-            elif inspect.iscoroutinefunction(policy_fn):
+            if policy_fn is not None and inspect.iscoroutinefunction(policy_fn):
                 raise TypeError("AxorToolWrapper policy_fn must be synchronous")
 
         def _evaluate(self, tool_input: dict) -> str | None:
@@ -86,19 +100,46 @@ def _make_tool_class():
                     pass
             return denial
 
-        def _run(self, *args: Any, **kwargs: Any) -> str:
+        def _admit(self, args: tuple, kwargs: dict):
+            """policy_fn, then the kernel gate: (Admitted, args, kwargs) or a refusal."""
+            from axor_langchain.governed import Admitted
             tool_input = kwargs if kwargs else ({"input": args[0]} if args else {})
             denial = self._evaluate(tool_input)
             if denial:
                 return f"tool_denied: {denial}"
-            return self._wrapped._run(*args, **kwargs)
+            verdict = self._gate.check(self.name, tool_input)
+            if not isinstance(verdict, Admitted):
+                return verdict.message()
+            if verdict.args != tool_input:  # MODEL.md 9: resolved references
+                if kwargs or not args:
+                    kwargs = dict(verdict.args)
+                else:
+                    args = (verdict.args.get("input", args[0]),) + tuple(args[1:])
+            return verdict, args, kwargs
+
+        def _run(self, *args: Any, **kwargs: Any) -> str:
+            admitted = self._admit(args, kwargs)
+            if isinstance(admitted, str):
+                return admitted
+            verdict, args, kwargs = admitted
+            try:
+                out = self._wrapped.invoke(kwargs if kwargs or not args else args[0])
+            except BaseException:
+                self._gate.fail(verdict)
+                raise
+            return self._gate.finish(verdict, self.name, out)
 
         async def _arun(self, *args: Any, **kwargs: Any) -> str:
-            tool_input = kwargs if kwargs else ({"input": args[0]} if args else {})
-            denial = self._evaluate(tool_input)
-            if denial:
-                return f"tool_denied: {denial}"
-            return await self._wrapped._arun(*args, **kwargs)
+            admitted = self._admit(args, kwargs)
+            if isinstance(admitted, str):
+                return admitted
+            verdict, args, kwargs = admitted
+            try:
+                out = await self._wrapped.ainvoke(kwargs if kwargs or not args else args[0])
+            except BaseException:
+                self._gate.fail(verdict)
+                raise
+            return self._gate.finish(verdict, self.name, out)
 
     return AxorToolWrapper
 

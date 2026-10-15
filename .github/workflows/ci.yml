@@ -25,6 +25,9 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/axor-core
           path: axor-core
+          # the kernel the gate is built for: claude/model-m1 (c9v4 frozen, c9v5 flags);
+          # its version number is still 0.11.0, so a pin by version cannot name it
+          ref: fa02df1f682e9bff0ef7d768a0293692c7fe9271
 
       - name: Log trigger context
         if: github.event_name == 'repository_dispatch'
