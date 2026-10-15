@@ -118,6 +118,14 @@ def _make_tool_class():
             return verdict, args, kwargs
 
         def _run(self, *args: Any, **kwargs: Any) -> str:
+            with self._gate.gate.lock:  # one call at a time, check to registration
+                return self._run_locked(args, kwargs)
+
+        async def _arun(self, *args: Any, **kwargs: Any) -> str:
+            async with self._gate.aserial:
+                return await self._arun_locked(args, kwargs)
+
+        def _run_locked(self, args: tuple, kwargs: dict) -> str:
             admitted = self._admit(args, kwargs)
             if isinstance(admitted, str):
                 return admitted
@@ -129,7 +137,7 @@ def _make_tool_class():
                 raise
             return self._gate.finish(verdict, self.name, out)
 
-        async def _arun(self, *args: Any, **kwargs: Any) -> str:
+        async def _arun_locked(self, args: tuple, kwargs: dict) -> str:
             admitted = self._admit(args, kwargs)
             if isinstance(admitted, str):
                 return admitted

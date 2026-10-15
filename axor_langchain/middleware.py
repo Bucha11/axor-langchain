@@ -1767,6 +1767,26 @@ def _make_axor_middleware_class():
             request: ToolCallRequest,
             handler: Callable[[ToolCallRequest], Any],
         ) -> Any:
+            if getattr(getattr(request, "tool", None), "_gate", None) is self._tool_gate:
+                return self._wrap_tool_call(request, handler)  # its wrapper serializes
+            with self._tool_gate.gate.lock:  # one call at a time, check to registration
+                return self._wrap_tool_call(request, handler)
+
+        async def awrap_tool_call(
+            self,
+            request: ToolCallRequest,
+            handler: Callable[[ToolCallRequest], Any],
+        ) -> Any:
+            if getattr(getattr(request, "tool", None), "_gate", None) is self._tool_gate:
+                return await self._awrap_tool_call(request, handler)  # its wrapper serializes
+            async with self._tool_gate.aserial:  # one call at a time, check to registration
+                return await self._awrap_tool_call(request, handler)
+
+        def _wrap_tool_call(
+            self,
+            request: ToolCallRequest,
+            handler: Callable[[ToolCallRequest], Any],
+        ) -> Any:
             """
             Tool result memoization via state["tool_result_cache"].
 
@@ -1870,7 +1890,7 @@ def _make_axor_middleware_class():
                 "tool_result_cache": new_cache,
             })
 
-        async def awrap_tool_call(
+        async def _awrap_tool_call(
             self,
             request: ToolCallRequest,
             handler: Callable[[ToolCallRequest], Any],

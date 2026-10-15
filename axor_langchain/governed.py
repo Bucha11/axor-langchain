@@ -8,6 +8,7 @@ registered and returned as the agent may see it (references for hidden values).
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from axor_langchain.gate import Admitted, Gate, Refused
@@ -32,6 +33,11 @@ class ToolGate:
     def __init__(self, gate: Gate) -> None:
         self.gate = gate
         self._requests: set[str] = set()
+        # LangGraph runs one message's tool calls concurrently (threads for sync
+        # tools, asyncio.gather for async ones). A call holds ``gate.lock`` (sync) or
+        # ``aserial`` (async) from check to registration, as the daemon's per-session
+        # lock does, so no call is decided before a concurrent one is registered.
+        self.aserial = asyncio.Lock()
 
     @classmethod
     def from_config(cls, governance: Any = None, *, confirmer: Any = None,

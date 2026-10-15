@@ -11,6 +11,11 @@ shim replays (axor-eval ``experiments/ajar/axor_ajar.py``), in the same order:
                           source's structure goes to the gate (MODEL.md 9.15)
     fail(adm)             the tool raised: the use stays spent, nothing is registered
 
+``lock`` makes check (evaluate + reserve) and finish (commit + register) atomic; an
+adapter whose framework runs tool calls concurrently holds it (or an asyncio lock of its
+own) from check to finish, so a call is decided on the session's state at the moment it
+runs, as the daemon's per-session lock does.
+
 Nothing here decides: every verdict is the governor's. This file is byte-identical in
 axor-claude, axor-openrouter, axor-langchain and axor-wrap; the compatibility check
 compares the four digests, so change it in all of them or in none.
@@ -19,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -50,6 +56,7 @@ class Gate:
                  structured: Callable[[str, Any], Any] | None = None) -> None:
         self.governor = governor
         self._structured = structured
+        self.lock = threading.RLock()
 
     @classmethod
     def from_config(cls, config: Any, *, confirmer: Any = None,
@@ -72,25 +79,31 @@ class Gate:
 
     def begin(self, task: str) -> None:
         """The user's own request (never model-written text)."""
-        g = self.governor
-        g.register_task(task)
-        if getattr(g, "_grant_args", None):
-            g.grants.from_request(task)
+        with self.lock:
+            g = self.governor
+            g.register_task(task)
+            if getattr(g, "_grant_args", None):
+                g.grants.from_request(task)
 
     def check(self, tool: str, args: dict[str, Any],
               call_key: str | None = None) -> "Admitted | Refused":
-        g = self.governor
-        d = g.evaluate(tool, dict(args or {}))
-        if not d.allowed:
-            return Refused(d.reason, d.category, d)
-        resolved = getattr(d, "resolved_args", None)
-        run = copy.deepcopy(resolved if resolved is not None else dict(args or {}))
-        key = g.spend(d, run, call_key=call_key)
-        if getattr(d, "grant_id", None) is not None and key is None:
-            return Refused("the grant was used up concurrently", "grant_gate", d)
-        return Admitted(d, run, key)
+        with self.lock:
+            g = self.governor
+            d = g.evaluate(tool, dict(args or {}))
+            if not d.allowed:
+                return Refused(d.reason, d.category, d)
+            resolved = getattr(d, "resolved_args", None)
+            run = copy.deepcopy(resolved if resolved is not None else dict(args or {}))
+            key = g.spend(d, run, call_key=call_key)
+            if getattr(d, "grant_id", None) is not None and key is None:
+                return Refused("the grant was used up concurrently", "grant_gate", d)
+            return Admitted(d, run, key)
 
     def finish(self, adm: Admitted, tool: str, output: Any) -> Any:
+        with self.lock:
+            return self._finish(adm, tool, output)
+
+    def _finish(self, adm: Admitted, tool: str, output: Any) -> Any:
         g = self.governor
         if adm.spend is not None:
             g.grant_store.commit(adm.spend)
@@ -110,5 +123,6 @@ class Gate:
         return view
 
     def fail(self, adm: Admitted) -> None:
-        if adm.spend is not None:
-            self.governor.grant_store.commit(adm.spend)
+        with self.lock:
+            if adm.spend is not None:
+                self.governor.grant_store.commit(adm.spend)
