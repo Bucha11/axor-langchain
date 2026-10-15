@@ -163,3 +163,56 @@ async def test_async_wrapped_tool_inside_the_middleware_does_not_deadlock():
     import asyncio
     msg = await asyncio.wait_for(mw.awrap_tool_call(req, handler), timeout=5)
     assert msg.content == "1810.0"
+
+
+# MODEL.md 9.15: a description grant needs the platform's parser of the source's output
+SLACK = {
+    "grant_args": {"add_user_to_channel": {"channel": "string", "user": "string"}},
+    "egress_sinks": ["add_user_to_channel"],
+    "driving_args": {"add_user_to_channel": ["channel", "user"]},
+    "operator_sets": {"add_user_to_channel": {"channel": ["general", "random", "private"]}},
+    "operator_sets_refuse_above": "benign",
+    "consequence_overrides": {"add_user_to_channel": "consequential"},
+    "description_sources": {"get_channels": [{"entity": "channel", "shape": "names", "complete": True}]},
+    "description_targets": {"channel": {"value": ["add_user_to_channel.channel"]}},
+}
+CHANNELS = ["general", "random", "private", "External_0"]
+DESCRIBED = "Add Charlie to the channel starting with External"
+ADD = {"channel": "External_0", "user": "Charlie"}
+
+
+def channels_parser(tool, result):
+    """The operator's parser for this platform: get_channels returns the list itself."""
+    return list(result) if tool == "get_channels" and isinstance(result, list) else None
+
+
+def text_channels_parser(tool, result):
+    """LangChain hands the middleware the tool's text: the operator's parser reads it."""
+    import ast
+    return channels_parser(tool, ast.literal_eval(result)) if tool == "get_channels" else None
+
+
+@pytest.mark.parametrize("structured", [text_channels_parser, None])
+def test_description_grant_needs_the_parser(structured):
+    """Without the operator's parser no description grant is built: the described call is
+    refused (operator_set), never admitted; with it the call runs."""
+    mw = AxorMiddleware(governance=SLACK, structured=structured, telemetry="off")
+    state = {"messages": [HumanMessage(DESCRIBED)]}
+    ran = []
+
+    def call(name, args, out):
+        req = ToolCallRequest(tool_call={"name": name, "args": args, "id": name}, tool=None,
+                              state=state, runtime=None)
+
+        def handler(r):
+            ran.append(name)
+            return ToolMessage(content=out, tool_call_id=name)
+        return mw.wrap_tool_call(req, handler)
+
+    call("get_channels", {}, repr(CHANNELS))
+    msg = call("add_user_to_channel", ADD, "added")
+    if structured is None:
+        assert getattr(msg, "status", None) == "error" and "(operator_set)" in msg.content
+        assert ran == ["get_channels"]
+    else:
+        assert msg.content == "added" and ran == ["get_channels", "add_user_to_channel"]

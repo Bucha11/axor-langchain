@@ -2133,6 +2133,19 @@ class AxorMiddleware(_AxorGovernanceCore):
     compression_mode : str | None
         Optional override for policy-selected compression. Accepts "auto",
         "aggressive"/"minimal", "balanced"/"moderate", or "light"/"broad".
+    governance : GovernanceConfig | str | dict | None
+        The kernel gate's configuration (or its YAML path / mapping). Every tool
+        call is decided by axor-core's ToolCallGovernor before it runs; None gates
+        under an empty configuration.
+    confirmer : the operator's L4 confirmation channel. Without one nothing is
+        confirmed.
+    structured : Callable[[str, Any], Any] | None
+        The platform's parser of a description source's output (axor-core MODEL.md
+        9.15): ``structured(tool, tool_message_text) -> structure | None``. Written by
+        the operator (this package ships none). Without it no description grant is
+        computed and a call only a description would authorize is refused.
+    tool_gate : ToolGate | None
+        A gate to share with other middleware / wrapped tools of the same session.
 
     Examples
     --------
