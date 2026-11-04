@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.1 — 2026-11-04
+
+### Changed
+- `IntentNormalizer` is imported from `axor_core.policy.normalizer`. It moved
+  there in axor-core 0.9.0; this package imported `axor_core.node.normalizer`,
+  which is where it lived up to 0.8.x. That import was correct for the pin this
+  package declared (`<0.7`) — moving it is what lets the pin reach a current
+  kernel at all.
+
+### Constraints
+- Pin: `axor-core>=0.9,<0.13` (was `>=0.6.0,<0.7`). The floor is the release
+  where `axor_core.policy.normalizer` first exists, so it is a consequence of
+  the import above, not a separate narrowing. The ceiling covers the 0.12 line;
+  0.12's breaking changes are STRICT-only and this package builds no governor.
+  Measured against an installed 0.11.0 and an installed 0.12.0 — 192 tests pass
+  on each.
+
+## 0.6.0 — 2026-05-25
+
+Tagged and published (`v0.6.0`, 38e2eae) without changelog entries; recorded
+here from the tag, not re-derived from the diff. It introduced
+`axor_langchain.wrapper` and `axor_langchain.normalizer`, extended
+`axor_langchain.middleware`, and added `_version.py` with its version test.
+
 ## 0.5.0 — 2026-05-04
 
 ### Added

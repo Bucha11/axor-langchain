@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "axor-langchain"
-version = "0.6.0"
+version = "0.6.1"
 description = "Governance middleware for LangChain 1.0 agents — powered by axor-core compression engines"
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,7 +19,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "axor-core>=0.6.0,<0.7",
+    # Floor raised 0.6 -> 0.9 together with the ceiling: `IntentNormalizer` moved
+    # from `axor_core.node.normalizer` to `axor_core.policy.normalizer` in core
+    # 0.9.0, and `axor_langchain.normalizer` now imports it from there. The old
+    # `axor_core.node.normalizer` resolved fine on 0.6.x, so the previous pin was
+    # self-consistent — it is THIS change that needs 0.9 as the floor: the new
+    # import does not exist before it. Raising the ceiling required the migration.
+    # Measured against an installed 0.12.0: 192 tests pass.
+    "axor-core>=0.9,<0.13",
     "langchain>=1.0.0",
     "langgraph>=1.0.0",
 ]
