@@ -228,6 +228,40 @@ class _HandledError(str):
     """
 
 
+def _message_refs(msg) -> list[str]:
+    """Refs an operator excision can name for a LangChain message: its id and,
+    for a tool result, the tool_call_id it answers."""
+    refs = []
+    for attr in ("id", "tool_call_id"):
+        val = getattr(msg, attr, None)
+        if isinstance(val, str) and val:
+            refs.append(val)
+    return refs
+
+
+def _message_provenance(messages) -> dict[str, str]:
+    """Every ref in the conversation is runtime-derived; the system prompt —
+    the operator's own configuration — sits outside ``messages`` and is
+    reported as ``system_prompt`` so an excision naming it is refused whole."""
+    prov = {"system_prompt": "operator_config"}
+    for m in messages:
+        kind = "operator_config" if getattr(m, "type", "") == "system" else "runtime"
+        for ref in _message_refs(m):
+            prov[ref] = kind
+    return prov
+
+
+_EXCISED = "[excised by operator]"
+
+
+def _redact_excised(msg, refs: set[str]):
+    """Redact, don't drop: an AIMessage's tool_call still needs its ToolMessage
+    or the provider rejects the request. Returns ``msg`` itself if untouched."""
+    if not refs.intersection(_message_refs(msg)) or msg.content == _EXCISED:
+        return msg
+    return msg.model_copy(update={"content": _EXCISED})
+
+
 class AxorCancelledError(RuntimeError):
     """Raised by the middleware when `cancel()` was called externally.
 
@@ -954,6 +988,7 @@ class _AxorGovernanceCore:
         tool_dedup_old_results: bool | None = None,
         tool_selection_stable: bool = True,
         token_cost_rates: Any | None = None,
+        plane: Any | None = None,
     ) -> None:
         profile = _normalize_optimization_profile(optimization_profile)
         profile_cfg = _OPTIMIZATION_PROFILES.get(profile or "", {})
@@ -1027,6 +1062,14 @@ class _AxorGovernanceCore:
         # Bound checkpointed tool cache; None means caller accepts unbounded state.
         self._max_tool_cache_entries = max_tool_cache_entries
         self._token_cost_rates = token_cost_rates
+
+        # Control Plane (axor-wrap PlaneAdmission or anything with the same
+        # surface). None = no plane: every hook below is a no-op.
+        self._plane = plane
+        self._plane_poll = 0.05
+        self._plane_calls = 0           # tool calls charged to the operator cap
+        self._excised_refs: set[str] = set()
+        self._directives_warned = False
 
         self._turn        = 0
         self._cancelled   = False
@@ -1526,6 +1569,7 @@ class _AxorGovernanceCore:
     def _prepare_model_request(self, request):
         self._ensure_engines()
         self._turn += 1
+        request = self._apply_plane_directives(request)
 
         tools = getattr(request, "tools", None) or []
         offered_count = len(tools)
@@ -1605,6 +1649,110 @@ class _AxorGovernanceCore:
     def is_cancelled(self) -> bool:
         return self._cancelled
 
+    # ── Control Plane ────────────────────────────────────────────────────────
+    #
+    # LangChain owns the agent loop, so the plane is honoured at the hooks it
+    # gives us: every model call and every tool call is a boundary. Pause holds
+    # there, stop cancels the run, and the operator's one-shot directives
+    # (excision, test-bench injection, call cap) apply to the next model call.
+
+    def _operator_stop(self, where: str) -> None:
+        self.cancel("operator_stop")
+        self._check_cancel(where)
+
+    def _plane_gate_sync(self, where: str) -> None:
+        plane = self._plane
+        posture = getattr(plane, "posture", None) if plane is not None else None
+        if posture is None:
+            return
+        while True:
+            self._check_cancel(where)
+            state = posture()
+            if state == "stopped":
+                self._operator_stop(where)
+            if state != "paused":
+                return
+            time.sleep(self._plane_poll)
+
+    async def _plane_gate_async(self, where: str) -> None:
+        plane = self._plane
+        if plane is None:
+            return
+        wait = getattr(plane, "await_admission", None)
+        if wait is not None:
+            if not await wait(self._session_id):
+                self._operator_stop(where)
+            self._check_cancel(where)
+            return
+        posture = getattr(plane, "posture", None)
+        while posture is not None:
+            self._check_cancel(where)
+            state = posture()
+            if state == "stopped":
+                self._operator_stop(where)
+            if state != "paused":
+                return
+            await asyncio.sleep(self._plane_poll)
+
+    def _plane_charge_call(self, tool_name: str) -> None:
+        """Count a real tool execution against the operator's call cap (a cap
+        the plane only ever lowers). Cache hits are free, as in core."""
+        cap_fn = getattr(self._plane, "budget_cap_calls", None) if self._plane else None
+        cap = cap_fn() if cap_fn is not None else None
+        if cap is not None and self._plane_calls >= cap:
+            from axor_core.errors import BudgetExceededError
+            raise BudgetExceededError(
+                spent=self._plane_calls, projected=1, limit=cap,
+            )
+        self._plane_calls += 1
+
+    def _apply_plane_directives(self, request):
+        plane = self._plane
+        if plane is None:
+            return request
+        messages = list(getattr(request, "messages", []) or [])
+        changed = False
+
+        take_excision = getattr(plane, "take_excision", None)
+        if take_excision is not None:
+            try:
+                directive = take_excision(_message_provenance(messages))
+            except ImportError:
+                # axor-core < 0.12.1 has no directives contract; the plane
+                # keeps the excision queued until the kernel can take it.
+                directive = None
+                if not self._directives_warned:
+                    self._directives_warned = True
+                    _log.warning(
+                        "axor: operator directives need axor-core>=0.12.1; "
+                        "excision/injection are not applied"
+                    )
+            if directive is not None:
+                self._excised_refs.update(directive.target_refs)
+        if self._excised_refs:
+            redacted = [_redact_excised(m, self._excised_refs) for m in messages]
+            changed = any(a is not b for a, b in zip(redacted, messages))
+            messages = redacted
+
+        take_injection = getattr(plane, "take_injection", None)
+        injection = None
+        if take_injection is not None:
+            try:
+                injection = take_injection()
+            except ImportError:
+                injection = None
+        if injection is not None:
+            from langchain_core.messages import HumanMessage
+            # Test-bench only (the plane refuses it otherwise), one call only,
+            # never written back to agent state, and marked untrusted.
+            messages.append(HumanMessage(
+                content=(f"[operator test-bench injection {injection.injection_id}"
+                         f" — untrusted input]\n{injection.text}"),
+            ))
+            changed = True
+
+        return request.override(messages=messages) if changed else request
+
     def _check_cancel(self, where: str) -> None:
         """Raise AxorCancelledError if cancellation has been requested.
 
@@ -1627,6 +1775,8 @@ class _AxorGovernanceCore:
         self._engines_ready  = False
         self._tool_selection_cache = None
         self._tool_selection_snapshot = None
+        self._plane_calls = 0
+        self._excised_refs = set()
 
     def wrap_tools(self, tools: list, policy_fn: Callable | None = None) -> list:
         """
@@ -1708,6 +1858,7 @@ def _make_axor_middleware_class():
               7. Record provider-counted input + output tokens.
             """
             self._check_cancel("wrap_model_call")
+            self._plane_gate_sync("wrap_model_call")
             request = self._prepare_model_request(request)
             self._check_cancel("wrap_model_call(post-prepare)")
             response = handler(request)
@@ -1720,6 +1871,7 @@ def _make_axor_middleware_class():
             handler: Callable[[ModelRequest], Any],
         ) -> ModelResponse:
             self._check_cancel("awrap_model_call")
+            await self._plane_gate_async("awrap_model_call")
             request = self._prepare_model_request(request)
             self._check_cancel("awrap_model_call(post-prepare)")
             response = await handler(request)
@@ -1748,6 +1900,7 @@ def _make_axor_middleware_class():
             needed (cache already contains this entry).
             """
             self._check_cancel("wrap_tool_call")
+            self._plane_gate_sync("wrap_tool_call")
             self._warn_callback_only_once()
             tc        = request.tool_call if hasattr(request, "tool_call") else {}
             tool_name = _tool_name(tc)
@@ -1785,6 +1938,7 @@ def _make_axor_middleware_class():
                     tool_call_id=tc_id or "",
                 )
 
+            self._plane_charge_call(tool_name)
             result = self._execute_tool_governed(tool_name, request, handler)
 
             if isinstance(result, _HandledError):
@@ -1828,6 +1982,9 @@ def _make_axor_middleware_class():
             request: ToolCallRequest,
             handler: Callable[[ToolCallRequest], Any],
         ) -> Any:
+            # Was missing: cancel() never stopped an async tool call.
+            self._check_cancel("awrap_tool_call")
+            await self._plane_gate_async("awrap_tool_call")
             tc        = request.tool_call if hasattr(request, "tool_call") else {}
             tool_name = _tool_name(tc)
             tc_id     = _tool_call_id(tc)
@@ -1863,6 +2020,7 @@ def _make_axor_middleware_class():
                     tool_call_id=tc_id or "",
                 )
 
+            self._plane_charge_call(tool_name)
             result = await self._aexecute_tool_governed(tool_name, request, handler)
 
             if isinstance(result, _HandledError):
@@ -2040,6 +2198,10 @@ class AxorMiddleware(_AxorGovernanceCore):
     token_cost_rates : axor_core.budget.TokenCostRates | None
         Optional provider/model pricing. When set, `cost_summary()` returns
         estimated money cost with prompt-cache write/read multipliers.
+    plane : axor_wrap.plane.PlaneAdmission | None
+        Control-Plane handle. Pause holds and stop cancels at every model/tool
+        call; operator excision, test-bench injection and call cap apply to the
+        next model/tool call. None (default) = no plane, no overhead.
     optimization_profile : str | None
         Named compression preset. "cautious" favors quality and keeps the last
         two tool results verbatim without tool relevance filtering.
@@ -2117,6 +2279,7 @@ class AxorMiddleware(_AxorGovernanceCore):
         tool_dedup_old_results: bool | None = None,
         tool_selection_stable: bool = True,
         token_cost_rates: Any | None = None,
+        plane: Any | None = None,
     ) -> None:
         if getattr(self, "_engines_ready", None) is not None:
             return
@@ -2147,4 +2310,5 @@ class AxorMiddleware(_AxorGovernanceCore):
             tool_dedup_old_results=tool_dedup_old_results,
             tool_selection_stable=tool_selection_stable,
             token_cost_rates=token_cost_rates,
+            plane=plane,
         )

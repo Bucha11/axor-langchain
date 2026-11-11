@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.2 — 2026-11-11
+
+### Added
+- **`AxorMiddleware(plane=...)`** — Control-Plane governance for a LangChain
+  agent. Pass an axor-wrap `PlaneAdmission`; every model call and tool call is a
+  boundary where the plane is honoured:
+  - **pause** holds the call until resume; **stop** cancels the run
+    (`AxorCancelledError`, reason `operator_stop`);
+  - **excision** — messages whose `id` / `tool_call_id` the operator names are
+    redacted (not dropped, so tool_call pairing stays valid) on that and every
+    later model call; the system prompt is reported as operator config, so an
+    excision naming it is refused whole (needs axor-core >= 0.12.1);
+  - **test-bench injection** goes into exactly one model call, marked untrusted,
+    never written to agent state;
+  - **operator call cap** bounds real tool executions (cache hits are free);
+    over the cap raises `BudgetExceededError`.
+  Sync agents need `PlaneAdmission.posture()` (axor-wrap >= 0.2.2).
+
+### Fixed
+- `awrap_tool_call` never checked `cancel()` — an async agent kept executing
+  tools after cancellation.
+
 ## 0.6.1 — 2026-11-04
 
 ### Changed
