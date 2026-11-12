@@ -228,6 +228,16 @@ class _HandledError(str):
     """
 
 
+def _answer_of(state: Any) -> str:
+    """The agent's final answer: the last AI message of the run's state."""
+    from axor_wrap.observe import _text
+
+    messages = (state or {}).get("messages", []) if isinstance(state, dict) else \
+        getattr(state, "messages", []) or []
+    ai = [m for m in messages if getattr(m, "type", None) == "ai"]
+    return _text(getattr(ai[-1], "content", "")) if ai else ""
+
+
 def _resolve_plane(plane: Any, node_id: str | None) -> tuple[Any, bool]:
     """``plane`` → (handle, owned). A URL builds a :class:`PlaneLink` the
     middleware owns; ``None`` does the same when ``AXOR_PLANE_URL`` is set;
@@ -1793,12 +1803,9 @@ class _AxorGovernanceCore:
         and the agent's final answer as the ``claim``. The structured claim is
         reconstructed from the calls observed here and the answer, by the same
         rule the plane applies to a black-box agent, and marked as such."""
-        from axor_langchain.observe import _text, evidence_of, reconstruct_claim
+        from axor_langchain.observe import evidence_of, reconstruct_claim
 
-        messages = (state or {}).get("messages", []) if isinstance(state, dict) else \
-            getattr(state, "messages", []) or []
-        ai = [m for m in messages if getattr(m, "type", None) == "ai"]
-        answer = _text(getattr(ai[-1], "content", "")) if ai else ""
+        answer = _answer_of(state)
         called = [t.tool for t in rec.tools if t.executed]
         lines = rec.pending_lines() + [{
             "kind": "claim",
@@ -1909,6 +1916,16 @@ class _AxorGovernanceCore:
             run_id, plane = rec.run_id, self._plane
             plane.submit(lambda: plane.connector.post_trace(lines, run_id))
 
+    def _ship_started(self, rec) -> None:
+        """An admitted call ships now, so a slow tool shows on the plane as
+        the run's current step rather than after it returns."""
+        if rec is None or not self._linked or self._recorder.experiment is not None:
+            return
+        rec.started = True
+        lines, run_id, plane = self._recorder.pending_lines(), self._recorder.run_id, self._plane
+        if lines:
+            plane.submit(lambda: plane.connector.post_trace(lines, run_id))
+
     def _observe_cache_hit(self, tool_name, tc_id, args, content) -> None:
         if self._recorder is not None:
             rec = self._recorder.begin_tool(tc_id, tool_name, args)
@@ -1922,6 +1939,7 @@ class _AxorGovernanceCore:
             if rec is not None:
                 self._recorder.end_tool(rec, "", status="denied")
             raise
+        self._ship_started(rec)
         exp = self._recorder.experiment if self._recorder is not None else None
         try:
             if exp is not None and exp.mode_for(tool_name):
@@ -1948,6 +1966,7 @@ class _AxorGovernanceCore:
             if rec is not None:
                 self._recorder.end_tool(rec, "", status="denied")
             raise
+        self._ship_started(rec)
         exp = self._recorder.experiment if self._recorder is not None else None
         try:
             if exp is not None and exp.mode_for(tool_name):
@@ -1981,6 +2000,11 @@ class _AxorGovernanceCore:
             return
         plane = self._plane
         lines = rec.pending_lines()
+        if rec.experiment is None:
+            # the agent's answer closes the run on the plane (an experiment
+            # run already shipped its own, with the reconstructed claims)
+            lines.append({"kind": "claim",
+                          "payload": {"text": _answer_of(state), "structured": False}})
         run_id = rec.run_id
         record = rec.audit_record(plane.node_id) if self._reputation is not None else None
         request = rec.last_request

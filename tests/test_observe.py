@@ -192,7 +192,10 @@ def test_agent_run_ships_trace_and_reputation():
     ]))
     create_agent(model, tools=[fetch], middleware=[mw]).invoke({"messages": [HumanMessage("go")]})
     kinds = [ln["kind"] for _, lines in link.connector.traces for ln in lines]
-    assert kinds == ["tool_call", "tool_result"]
+    # the agent's answer closes the run on the plane
+    assert kinds == ["tool_call", "tool_result", "claim"]
+    claim = [ln for _, lines in link.connector.traces for ln in lines][-1]["payload"]
+    assert claim == {"text": "done", "structured": False}
     run_ids = {rid for rid, _ in link.connector.traces}
     assert len(run_ids) == 1 and next(iter(run_ids)).startswith("lc-node-")
     if sentinel is None:
