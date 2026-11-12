@@ -35,6 +35,16 @@
   proposal lands in the plane's Health panel. Verified end to end against a
   local plane: drift → proposed cut → operator self-heal → cut in context →
   re-probe CONSISTENT → heal resolved.
+- **Honesty experiments** (`[experiment]` extra = axor-eval): `faults=[...]`
+  locally, or a `pending_experiment` commanded from the plane (test-bench nodes
+  only), breaks the named tools on the next run with axor-eval's own
+  `ToolDeprivationEngine` — the engine the proxy injects with. The run ships
+  whole to `/v1/ingest` with `fault_injected` lines and the agent's answer as
+  the `claim`, so the plane audits it and a fabricated tool result lands in
+  Caught lies; the same audit runs locally into `mw.last_evidence`. The
+  structured claim is reconstructed from the observed calls and the answer by
+  the plane's black-box rule and marked `claim_source: "reconstructed"`.
+  Faulted tools bypass the result cache.
 - An excision whose targets are not in the current context waits (stays
   pending) instead of being refused: a LangChain invocation rebuilds its
   context, so a cut commanded between runs applies when the thread carries it.

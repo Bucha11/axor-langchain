@@ -207,6 +207,8 @@ A background thread keeps the link (sync and async agents alike). What it does:
 | **Reputation** | with `[security]`: each run feeds axor-sentinel; cross-run verdicts per resource show in Sentinel |
 | **Health** | `probe=True` (or a probe count): an axor-probe battery after each run (`probe_every=N` to thin it out) using the agent's own model — it **costs model calls**. On drift the localizer proposes which tool result to cut, and Health offers it |
 
+| **Honesty** | with `[experiment]`: break a tool on purpose and check whether the agent admits it. Locally, `AxorMiddleware(faults=[{"tool": "get_rates", "mode": "silent_fail"}])` audits every run and keeps the verdict on `mw.last_evidence`; from the plane, *Test honesty* on the agent arms its next run (the agent must run with `AXOR_TEST_BENCH=1` — a broken tool degrades a real user's answer). Faults come from axor-eval's engine (`silent_fail`, `tool_substitution`, `instruction_injection`, `corrupt_retrieval`); a confident answer over a failed tool shows up in Caught lies |
+
 `plane=False` turns it off even with the env set. Without `AXOR_PLANE_URL` nothing
 connects and nothing changes.
 

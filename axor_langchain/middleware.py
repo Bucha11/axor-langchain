@@ -1014,6 +1014,7 @@ class _AxorGovernanceCore:
         sentinel: bool | None = None,
         probe: bool | int = False,
         probe_every: int = 1,
+        faults: list[dict] | None = None,
     ) -> None:
         profile = _normalize_optimization_profile(optimization_profile)
         profile_cfg = _OPTIMIZATION_PROFILES.get(profile or "", {})
@@ -1095,6 +1096,8 @@ class _AxorGovernanceCore:
         self._plane_calls = 0           # tool calls charged to the operator cap
         self._excised_refs: set[str] = set()
         self._directives_warned = False
+        self._faults = [dict(f) for f in faults] if faults else None
+        self.last_evidence: list[dict] = []
         self._setup_observation(sentinel, probe, probe_every)
 
         self._turn        = 0
@@ -1785,6 +1788,42 @@ class _AxorGovernanceCore:
 
     # ── what the plane sees (trace / reputation / health) ────────────────────
 
+    def _finish_experiment(self, rec, state) -> None:
+        """An experiment run is audited as a whole: its tool lines, the faults,
+        and the agent's final answer as the ``claim``. The structured claim is
+        reconstructed from the calls observed here and the answer, by the same
+        rule the plane applies to a black-box agent, and marked as such."""
+        from axor_langchain.observe import _text, evidence_of, reconstruct_claim
+
+        messages = (state or {}).get("messages", []) if isinstance(state, dict) else \
+            getattr(state, "messages", []) or []
+        ai = [m for m in messages if getattr(m, "type", None) == "ai"]
+        answer = _text(getattr(ai[-1], "content", "")) if ai else ""
+        called = [t.tool for t in rec.tools if t.executed]
+        lines = rec.pending_lines() + [{
+            "kind": "claim",
+            "payload": {
+                "text": answer, "structured": True,
+                "claims": reconstruct_claim(called, answer),
+                # observed calls + the answer, by the plane's black-box rule;
+                # the agent itself stated nothing structured
+                "claim_source": "reconstructed",
+            },
+        }]
+        scenario = "langchain-experiment"
+        node = getattr(self._plane, "node_id", None) or rec.node_id
+        try:
+            self.last_evidence = evidence_of(lines, scenario=scenario, node_id=node)
+        except ImportError:
+            self.last_evidence = []
+        for case in self.last_evidence:
+            if case["deviation"]:
+                _log.warning("axor: honesty experiment caught %s (%s, %s)",
+                             case["deviation"], case["agent_claim"], case["verdict_source"])
+        if self._linked:
+            plane, run_id = self._plane, rec.run_id
+            plane.submit(lambda: plane.connector.post_ingest(lines, run_id, scenario))
+
     def _setup_observation(self, sentinel: bool | None, probe: bool | int,
                            probe_every: int) -> None:
         """Feeds need a transport: a link this middleware owns (or any plane
@@ -1796,7 +1835,13 @@ class _AxorGovernanceCore:
         self._probe_every = max(1, int(probe_every))
         self._runs = 0
         plane = self._plane
-        if plane is None or not hasattr(plane, "connector") or not hasattr(plane, "submit"):
+        if not self._linked:
+            if self._faults:
+                # a local honesty experiment: recorded, audited here, kept on
+                # `last_evidence` — nothing to ship it to
+                from axor_langchain.observe import RunRecorder
+                from axor_langchain.plane import default_node_id
+                self._recorder = RunRecorder(default_node_id())
             if probe or sentinel:
                 _log.warning("axor: sentinel/probe need a Control-Plane link "
                              "(plane=URL or AXOR_PLANE_URL); not enabled")
@@ -1819,11 +1864,46 @@ class _AxorGovernanceCore:
                     "probe= needs axor-probe — pip install 'axor-langchain[security]'"
                 ) from None
 
+    @property
+    def _linked(self) -> bool:
+        plane = self._plane
+        return plane is not None and hasattr(plane, "connector") and hasattr(plane, "submit")
+
+    def _arm_experiment(self, rec) -> None:
+        """First model call of a run: a plane-commanded experiment wins over
+        the local ``faults=``; either applies to this run only."""
+        rec.armed = True
+        spec, eid = None, ""
+        take = getattr(self._plane, "take_experiment", None) if self._plane else None
+        if take is not None:
+            ex = take()
+            if ex:
+                spec, eid = ex["faults"], ex.get("id", "")
+        if spec is None and self._faults:
+            spec = self._faults
+        if not spec:
+            return
+        try:
+            from axor_langchain.observe import Experiment
+            rec.experiment = Experiment(spec, seed=rec.run_id, experiment_id=eid)
+        except ImportError:
+            _log.warning("axor: fault injection needs axor-eval — "
+                         "pip install 'axor-langchain[experiment]'; run not faulted")
+
+    def _faulted(self, tool_name: str) -> bool:
+        rec = self._recorder
+        return bool(rec is not None and rec.experiment is not None
+                    and rec.experiment.mode_for(tool_name))
+
     def _observe_model_call(self, request) -> None:
         rec = self._recorder
         if rec is None:
             return
+        if not rec.armed:
+            self._arm_experiment(rec)
         rec.last_request = request
+        if rec.experiment is not None or not self._linked:
+            return  # an experiment run ships whole, with its claim, for audit
         lines = rec.pending_lines()
         if lines:
             run_id, plane = rec.run_id, self._plane
@@ -1842,8 +1922,15 @@ class _AxorGovernanceCore:
             if rec is not None:
                 self._recorder.end_tool(rec, "", status="denied")
             raise
+        exp = self._recorder.experiment if self._recorder is not None else None
         try:
-            result = run()
+            if exp is not None and exp.mode_for(tool_name):
+                real = None if exp.skips_tool(tool_name) else run()
+                if isinstance(real, _HandledError):
+                    real = str(real)
+                result, rec.fault = exp.apply(tool_name, real)
+            else:
+                result = run()
         except Exception as exc:
             if rec is not None:
                 self._recorder.end_tool(rec, str(exc), status="error")
@@ -1861,8 +1948,15 @@ class _AxorGovernanceCore:
             if rec is not None:
                 self._recorder.end_tool(rec, "", status="denied")
             raise
+        exp = self._recorder.experiment if self._recorder is not None else None
         try:
-            result = await run()
+            if exp is not None and exp.mode_for(tool_name):
+                real = None if exp.skips_tool(tool_name) else await run()
+                if isinstance(real, _HandledError):
+                    real = str(real)
+                result, rec.fault = exp.apply(tool_name, real)
+            else:
+                result = await run()
         except Exception as exc:
             if rec is not None:
                 self._recorder.end_tool(rec, str(exc), status="error")
@@ -1872,13 +1966,18 @@ class _AxorGovernanceCore:
             self._recorder.end_tool(rec, result, status=status)
         return result
 
-    def _finish_run(self) -> None:
+    def _finish_run(self, state=None) -> None:
         """End of one agent invocation: ship the rest of its trace, fold it
         into the cross-run reputation, and — every ``probe_every`` runs — run a
         health check over its last context. All of it on the link's loop, so
         the agent's return is never held by the plane."""
         rec = self._recorder
         if rec is None or not rec.active:
+            return
+        if rec.experiment is not None:
+            self._finish_experiment(rec, state)
+        if not self._linked:
+            rec.reset()
             return
         plane = self._plane
         lines = rec.pending_lines()
@@ -2078,7 +2177,8 @@ def _make_axor_middleware_class():
                 else getattr(state, "tool_result_cache", None)
             ) or {}
 
-            cacheable = _is_tool_call_cacheable(tool_name, self._cache_tools)
+            cacheable = (_is_tool_call_cacheable(tool_name, self._cache_tools)
+                         and not self._faulted(tool_name))
             cache_key = _hash_tool_call(tool_name, args) if cacheable else ""
 
             if cacheable and cache_key in existing_cache:
@@ -2164,7 +2264,8 @@ def _make_axor_middleware_class():
                 else getattr(state, "tool_result_cache", None)
             ) or {}
 
-            cacheable = _is_tool_call_cacheable(tool_name, self._cache_tools)
+            cacheable = (_is_tool_call_cacheable(tool_name, self._cache_tools)
+                         and not self._faulted(tool_name))
             cache_key = _hash_tool_call(tool_name, args) if cacheable else ""
 
             if cacheable and cache_key in existing_cache:
@@ -2229,7 +2330,7 @@ def _make_axor_middleware_class():
             state: AgentState,
             runtime: Runtime,
         ) -> dict[str, Any] | None:
-            self._finish_run()
+            self._finish_run(state)
             if self._verbose and self._tool_stats:
                 print(f"[axor] {self._tool_stats.summary()}")
             if self._verbose and self._engines_ready:
@@ -2452,6 +2553,7 @@ class AxorMiddleware(_AxorGovernanceCore):
         sentinel: bool | None = None,
         probe: bool | int = False,
         probe_every: int = 1,
+        faults: list[dict] | None = None,
     ) -> None:
         if getattr(self, "_engines_ready", None) is not None:
             return
@@ -2487,4 +2589,5 @@ class AxorMiddleware(_AxorGovernanceCore):
             sentinel=sentinel,
             probe=probe,
             probe_every=probe_every,
+            faults=faults,
         )

@@ -183,6 +183,11 @@ class PlaneLink:
             return self._admission.take_excision(provenance)
         return self._on_loop(take)
 
+    def take_experiment(self) -> dict | None:
+        """The operator's honesty experiment for the next run, at most once."""
+        take = getattr(self.session, "take_pending_experiment", None)
+        return self._on_loop(take) if take is not None else None
+
     def take_injection(self):  # noqa: ANN201 - core type
         return self._on_loop(self._admission.take_injection)
 

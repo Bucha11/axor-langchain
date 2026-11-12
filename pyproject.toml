@@ -36,6 +36,7 @@ memory    = ["axor-memory-sqlite>=0.3.0,<0.4"]  # cross-session memory
 telemetry = ["axor-telemetry>=0.4.0,<0.5"] # anonymous opt-in classifier signals
 plane     = ["axor-wrap[plane]>=0.2.2,<0.3"]  # Control-Plane link (AXOR_PLANE_URL)
 security  = ["axor-probe", "axor-sentinel"]  # health checks + cross-run reputation on the plane
+experiment = ["axor-eval>=0.2.2"]  # honesty experiments: fault injection + audit
 anthropic = ["langchain-anthropic>=0.3.0"]
 openai    = ["langchain-openai>=0.3.0"]
 providers = ["langchain-anthropic>=0.3.0", "langchain-openai>=0.3.0"]
