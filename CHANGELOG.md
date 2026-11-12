@@ -24,6 +24,20 @@
   delivers queued acks at `close()` / interpreter exit. `plane=False` opts out
   even with the env set; an env-driven plane without the extra logs a warning
   instead of breaking the agent. New extra: `axor-langchain[plane]`.
+- **The plane sees the agent.** With a link, every invocation is a plane run:
+  `tool_call` / `tool_result` lines whose `value_ref` is the `tool_call_id` —
+  the ref an excision cuts by — with taint by locator (url → web, path → file)
+  and `arg_refs` where an argument quotes an earlier result. With `[security]`:
+  each run becomes core's `SessionAuditRecord`, goes through axor-sentinel's
+  `CoreSessionSink` and evidence model, and the cross-run `ReputationSnapshot`
+  is posted. `probe=True` runs an axor-probe battery after each run with the
+  agent's own model and, on drift, `localize` over the tool results; the
+  proposal lands in the plane's Health panel. Verified end to end against a
+  local plane: drift → proposed cut → operator self-heal → cut in context →
+  re-probe CONSISTENT → heal resolved.
+- An excision whose targets are not in the current context waits (stays
+  pending) instead of being refused: a LangChain invocation rebuilds its
+  context, so a cut commanded between runs applies when the thread carries it.
 
 ### Fixed
 - `awrap_tool_call` never checked `cancel()` — an async agent kept executing

@@ -300,3 +300,21 @@ def test_caller_supplied_plane_is_not_closed_by_middleware():
     plane = _Plane()
     plane.close = lambda: (_ for _ in ()).throw(AssertionError("closed"))
     AxorMiddleware(telemetry="off", plane=plane).close()
+
+
+def test_link_excision_waits_until_its_target_is_in_context():
+    pytest.importorskip("axor_core.contracts.directives")
+    pytest.importorskip("axor_wrap.plane.session")
+    from axor_langchain.plane import PlaneLink
+
+    link = PlaneLink("http://cp.invalid", "n1", start=False)
+    link.session.apply_snapshot(1, {"pending_excision": {
+        "id": "ex1", "target_refs": ["tc9"], "operator": "op", "reason": "r"}})
+    # a fresh invocation: tc9 not in context yet — the cut stays queued
+    assert link.take_excision({"system_prompt": "operator_config", "h1": "runtime"}) is None
+    assert link.session.pending_excision is not None
+    assert not any(e["kind"] == "excision_refused" for e in link.session.outbox)
+    # the thread carries it again: now it is taken, and acked
+    d = link.take_excision({"tc9": "runtime"})
+    assert d is not None and d.target_refs == ("tc9",)
+    assert any(e["kind"] == "context_excision" for e in link.session.outbox)

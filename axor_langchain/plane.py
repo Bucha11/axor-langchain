@@ -171,7 +171,17 @@ class PlaneLink:
         return self._admission.budget_cap_calls()
 
     def take_excision(self, provenance):  # noqa: ANN001, ANN201 - core types
-        return self._on_loop(lambda: self._admission.take_excision(provenance))
+        """Hand over the queued excision once every ref it names is in the
+        current context. A LangChain invocation rebuilds its context, so a cut
+        commanded between runs waits for the conversation (same thread_id) to
+        carry its target again, instead of the kernel's guard refusing a ref it
+        cannot see — an absent ref reads as operator config there."""
+        def take():  # noqa: ANN202
+            pending = getattr(self.session, "pending_excision", None)
+            if pending is not None and any(r not in provenance for r in pending.target_refs):
+                return None
+            return self._admission.take_excision(provenance)
+        return self._on_loop(take)
 
     def take_injection(self):  # noqa: ANN201 - core type
         return self._on_loop(self._admission.take_injection)

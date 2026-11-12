@@ -180,6 +180,36 @@ so compression runs first and the Anthropic middleware places `cache_control`
 markers on the final, compressed message set. The reverse order can stamp
 markers onto messages that Axor then rewrites, dropping the cache hit.
 
+## Control Plane
+
+Connect the agent to an [Axor Control Plane](https://github.com/Bucha11/axor-control-plane)
+and it becomes a governed node — no other code change:
+
+```bash
+pip install 'axor-langchain[plane,security]'
+export AXOR_PLANE_URL=https://your-plane
+export AXOR_NODE_ID=support-agent
+export AXOR_INGEST_KEY=ak_...          # node-bound key, minted in the plane
+```
+
+```python
+agent = create_agent(model, tools, middleware=[AxorMiddleware()])          # env-configured
+# or explicitly: AxorMiddleware(plane="https://your-plane", node_id="support-agent", probe=True)
+```
+
+A background thread keeps the link (sync and async agents alike). What it does:
+
+| | |
+|---|---|
+| **Control** | pause holds every model/tool call, stop cancels the run (`AxorCancelledError`), the operator's call cap bounds tool executions, a test-bench injection lands in one model call |
+| **Excision** | an operator cut redacts the named tool result (`tool_call_id`) from every later model call. Commanded between runs, it waits until the conversation (same `thread_id`) carries its target |
+| **Trace** | each invocation is a plane run: tool calls and results with their taint, in Replay and the taint graph |
+| **Reputation** | with `[security]`: each run feeds axor-sentinel; cross-run verdicts per resource show in Sentinel |
+| **Health** | `probe=True` (or a probe count): an axor-probe battery after each run (`probe_every=N` to thin it out) using the agent's own model — it **costs model calls**. On drift the localizer proposes which tool result to cut, and Health offers it |
+
+`plane=False` turns it off even with the env set. Without `AXOR_PLANE_URL` nothing
+connects and nothing changes.
+
 ## Telemetry
 
 Telemetry is off by default.

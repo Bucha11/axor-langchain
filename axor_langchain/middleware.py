@@ -1011,6 +1011,9 @@ class _AxorGovernanceCore:
         token_cost_rates: Any | None = None,
         plane: Any | None = None,
         node_id: str | None = None,
+        sentinel: bool | None = None,
+        probe: bool | int = False,
+        probe_every: int = 1,
     ) -> None:
         profile = _normalize_optimization_profile(optimization_profile)
         profile_cfg = _OPTIMIZATION_PROFILES.get(profile or "", {})
@@ -1092,6 +1095,7 @@ class _AxorGovernanceCore:
         self._plane_calls = 0           # tool calls charged to the operator cap
         self._excised_refs: set[str] = set()
         self._directives_warned = False
+        self._setup_observation(sentinel, probe, probe_every)
 
         self._turn        = 0
         self._cancelled   = False
@@ -1779,6 +1783,129 @@ class _AxorGovernanceCore:
     def plane(self) -> Any:
         return self._plane
 
+    # ── what the plane sees (trace / reputation / health) ────────────────────
+
+    def _setup_observation(self, sentinel: bool | None, probe: bool | int,
+                           probe_every: int) -> None:
+        """Feeds need a transport: a link this middleware owns (or any plane
+        exposing ``connector`` + ``submit``). A bare PlaneAdmission only takes
+        commands, so nothing is recorded for it."""
+        self._recorder = None
+        self._reputation = None
+        self._health = None
+        self._probe_every = max(1, int(probe_every))
+        self._runs = 0
+        plane = self._plane
+        if plane is None or not hasattr(plane, "connector") or not hasattr(plane, "submit"):
+            if probe or sentinel:
+                _log.warning("axor: sentinel/probe need a Control-Plane link "
+                             "(plane=URL or AXOR_PLANE_URL); not enabled")
+            return
+        from axor_langchain.observe import HealthCheck, ReputationBook, RunRecorder
+        self._recorder = RunRecorder(plane.node_id)
+        if sentinel is not False:
+            try:
+                self._reputation = ReputationBook()
+            except ImportError:
+                if sentinel:
+                    raise RuntimeError(
+                        "sentinel=True needs axor-sentinel — "
+                        "pip install 'axor-langchain[security]'") from None
+        if probe:
+            try:
+                self._health = HealthCheck(probes=3 if probe is True else int(probe))
+            except ImportError:
+                raise RuntimeError(
+                    "probe= needs axor-probe — pip install 'axor-langchain[security]'"
+                ) from None
+
+    def _observe_model_call(self, request) -> None:
+        rec = self._recorder
+        if rec is None:
+            return
+        rec.last_request = request
+        lines = rec.pending_lines()
+        if lines:
+            run_id, plane = rec.run_id, self._plane
+            plane.submit(lambda: plane.connector.post_trace(lines, run_id))
+
+    def _observe_cache_hit(self, tool_name, tc_id, args, content) -> None:
+        if self._recorder is not None:
+            rec = self._recorder.begin_tool(tc_id, tool_name, args)
+            self._recorder.end_tool(rec, content)
+
+    def _observed_tool(self, tool_name, tc_id, args, run):
+        rec = self._recorder.begin_tool(tc_id, tool_name, args) if self._recorder else None
+        try:
+            self._plane_charge_call(tool_name)
+        except Exception:
+            if rec is not None:
+                self._recorder.end_tool(rec, "", status="denied")
+            raise
+        try:
+            result = run()
+        except Exception as exc:
+            if rec is not None:
+                self._recorder.end_tool(rec, str(exc), status="error")
+            raise
+        if rec is not None:
+            status = "error" if isinstance(result, _HandledError) else "ok"
+            self._recorder.end_tool(rec, result, status=status)
+        return result
+
+    async def _aobserved_tool(self, tool_name, tc_id, args, run):
+        rec = self._recorder.begin_tool(tc_id, tool_name, args) if self._recorder else None
+        try:
+            self._plane_charge_call(tool_name)
+        except Exception:
+            if rec is not None:
+                self._recorder.end_tool(rec, "", status="denied")
+            raise
+        try:
+            result = await run()
+        except Exception as exc:
+            if rec is not None:
+                self._recorder.end_tool(rec, str(exc), status="error")
+            raise
+        if rec is not None:
+            status = "error" if isinstance(result, _HandledError) else "ok"
+            self._recorder.end_tool(rec, result, status=status)
+        return result
+
+    def _finish_run(self) -> None:
+        """End of one agent invocation: ship the rest of its trace, fold it
+        into the cross-run reputation, and — every ``probe_every`` runs — run a
+        health check over its last context. All of it on the link's loop, so
+        the agent's return is never held by the plane."""
+        rec = self._recorder
+        if rec is None or not rec.active:
+            return
+        plane = self._plane
+        lines = rec.pending_lines()
+        run_id = rec.run_id
+        record = rec.audit_record(plane.node_id) if self._reputation is not None else None
+        request = rec.last_request
+        self._runs += 1
+        probe_now = self._health is not None and request is not None \
+            and self._runs % self._probe_every == 0
+        rec.reset()
+        book, health = self._reputation, self._health
+
+        async def ship() -> None:
+            if lines:
+                await plane.connector.post_trace(lines, run_id)
+            if record is not None:
+                await book.add(record)
+                if not book.empty:
+                    await plane.connector.post_reputation(book.snapshot())
+            if probe_now:
+                body = await health.run(request=request, node_id=plane.node_id,
+                                        run_id=run_id)
+                if body is not None:
+                    await plane.connector.post_health_check(body)
+
+        plane.submit(ship)
+
     def close(self) -> None:
         """Close a Control-Plane link this middleware opened (delivers what is
         queued first). Also runs at interpreter exit."""
@@ -1892,6 +2019,7 @@ def _make_axor_middleware_class():
             self._check_cancel("wrap_model_call")
             self._plane_gate_sync("wrap_model_call")
             request = self._prepare_model_request(request)
+            self._observe_model_call(request)
             self._check_cancel("wrap_model_call(post-prepare)")
             response = handler(request)
             self._record_usage_from_response(response)
@@ -1905,6 +2033,7 @@ def _make_axor_middleware_class():
             self._check_cancel("awrap_model_call")
             await self._plane_gate_async("awrap_model_call")
             request = self._prepare_model_request(request)
+            self._observe_model_call(request)
             self._check_cancel("awrap_model_call(post-prepare)")
             response = await handler(request)
             self._record_usage_from_response(response)
@@ -1965,13 +2094,16 @@ def _make_axor_middleware_class():
                         input_tokens=0, output_tokens=0,
                         tool_tokens=max(len(cached_content) // 4, 1),
                     )
+                self._observe_cache_hit(tool_name, tc_id, args, cached_content)
                 return ToolMessage(
                     content=cached_content,
                     tool_call_id=tc_id or "",
                 )
 
-            self._plane_charge_call(tool_name)
-            result = self._execute_tool_governed(tool_name, request, handler)
+            result = self._observed_tool(
+                tool_name, tc_id, args,
+                lambda: self._execute_tool_governed(tool_name, request, handler),
+            )
 
             if isinstance(result, _HandledError):
                 return ToolMessage(content=str(result), tool_call_id=tc_id or "")
@@ -2047,13 +2179,16 @@ def _make_axor_middleware_class():
                         input_tokens=0, output_tokens=0,
                         tool_tokens=max(len(cached_content) // 4, 1),
                     )
+                self._observe_cache_hit(tool_name, tc_id, args, cached_content)
                 return ToolMessage(
                     content=cached_content,
                     tool_call_id=tc_id or "",
                 )
 
-            self._plane_charge_call(tool_name)
-            result = await self._aexecute_tool_governed(tool_name, request, handler)
+            result = await self._aobserved_tool(
+                tool_name, tc_id, args,
+                lambda: self._aexecute_tool_governed(tool_name, request, handler),
+            )
 
             if isinstance(result, _HandledError):
                 return ToolMessage(content=str(result), tool_call_id=tc_id or "")
@@ -2094,6 +2229,7 @@ def _make_axor_middleware_class():
             state: AgentState,
             runtime: Runtime,
         ) -> dict[str, Any] | None:
+            self._finish_run()
             if self._verbose and self._tool_stats:
                 print(f"[axor] {self._tool_stats.summary()}")
             if self._verbose and self._engines_ready:
@@ -2313,6 +2449,9 @@ class AxorMiddleware(_AxorGovernanceCore):
         token_cost_rates: Any | None = None,
         plane: Any | None = None,
         node_id: str | None = None,
+        sentinel: bool | None = None,
+        probe: bool | int = False,
+        probe_every: int = 1,
     ) -> None:
         if getattr(self, "_engines_ready", None) is not None:
             return
@@ -2345,4 +2484,7 @@ class AxorMiddleware(_AxorGovernanceCore):
             token_cost_rates=token_cost_rates,
             plane=plane,
             node_id=node_id,
+            sentinel=sentinel,
+            probe=probe,
+            probe_every=probe_every,
         )
