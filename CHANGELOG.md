@@ -17,6 +17,13 @@
   - **operator call cap** bounds real tool executions (cache hits are free);
     over the cap raises `BudgetExceededError`.
   Sync agents need `PlaneAdmission.posture()` (axor-wrap >= 0.2.2).
+- **Connects on its own.** `AxorMiddleware(plane="https://cp…", node_id=...)`,
+  or no argument at all with `AXOR_PLANE_URL` / `AXOR_NODE_ID` /
+  `AXOR_INGEST_KEY` set: a background thread keeps the node live on the plane
+  (desired-state subscription + heartbeat) for sync and async agents alike, and
+  delivers queued acks at `close()` / interpreter exit. `plane=False` opts out
+  even with the env set; an env-driven plane without the extra logs a warning
+  instead of breaking the agent. New extra: `axor-langchain[plane]`.
 
 ### Fixed
 - `awrap_tool_call` never checked `cancel()` — an async agent kept executing

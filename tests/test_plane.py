@@ -229,3 +229,74 @@ def test_real_create_agent_run_sees_excision_and_pause_gate():
     assert out["messages"][-1].content == "done"
     tool_seen = [m for m in seen[-1] if isinstance(m, ToolMessage)]
     assert tool_seen and tool_seen[0].content == "[excised by operator]"
+
+
+# ── plane resolution: URL / env / off ─────────────────────────────────────────
+
+class _FakeLink:
+    instances: list = []
+
+    def __init__(self, url, node_id=None, **kw):
+        self.url, self.node_id, self.closed = url, node_id, False
+        _FakeLink.instances.append(self)
+
+    def posture(self):
+        return "running"
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_link(monkeypatch):
+    import axor_langchain.plane as plane_mod
+    _FakeLink.instances.clear()
+    monkeypatch.setattr(plane_mod, "PlaneLink", _FakeLink)
+    return _FakeLink
+
+
+def test_url_builds_an_owned_link(fake_link):
+    mw = AxorMiddleware(telemetry="off", plane="http://cp:8400", node_id="n1")
+    assert isinstance(mw.plane, _FakeLink)
+    assert (mw.plane.url, mw.plane.node_id) == ("http://cp:8400", "n1")
+    mw.close()
+    assert mw.plane.closed
+
+
+def test_env_url_connects_without_code(fake_link, monkeypatch):
+    monkeypatch.setenv("AXOR_PLANE_URL", "http://cp:8400")
+    mw = AxorMiddleware(telemetry="off")
+    assert isinstance(mw.plane, _FakeLink) and mw.plane.url == "http://cp:8400"
+
+
+def test_plane_false_wins_over_env(fake_link, monkeypatch):
+    monkeypatch.setenv("AXOR_PLANE_URL", "http://cp:8400")
+    assert AxorMiddleware(telemetry="off", plane=False).plane is None
+    assert not fake_link.instances
+
+
+def test_no_env_no_plane(fake_link, monkeypatch):
+    monkeypatch.delenv("AXOR_PLANE_URL", raising=False)
+    assert AxorMiddleware(telemetry="off").plane is None
+
+
+def test_env_plane_without_extra_warns_instead_of_breaking(monkeypatch, caplog):
+    import axor_langchain.plane as plane_mod
+
+    def boom(*a, **kw):
+        raise RuntimeError("needs axor-wrap[plane]")
+
+    monkeypatch.setattr(plane_mod, "PlaneLink", boom)
+    monkeypatch.setenv("AXOR_PLANE_URL", "http://cp:8400")
+    with caplog.at_level("WARNING"):
+        assert AxorMiddleware(telemetry="off").plane is None
+    assert "axor-wrap[plane]" in caplog.text
+    # an explicit URL is a request, not a hint: it raises
+    with pytest.raises(RuntimeError):
+        AxorMiddleware(telemetry="off", plane="http://cp:8400")
+
+
+def test_caller_supplied_plane_is_not_closed_by_middleware():
+    plane = _Plane()
+    plane.close = lambda: (_ for _ in ()).throw(AssertionError("closed"))
+    AxorMiddleware(telemetry="off", plane=plane).close()

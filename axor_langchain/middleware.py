@@ -228,6 +228,27 @@ class _HandledError(str):
     """
 
 
+def _resolve_plane(plane: Any, node_id: str | None) -> tuple[Any, bool]:
+    """``plane`` → (handle, owned). A URL builds a :class:`PlaneLink` the
+    middleware owns; ``None`` does the same when ``AXOR_PLANE_URL`` is set;
+    ``False`` turns the plane off even then; anything else is used as given."""
+    if plane is False:
+        return None, False
+    if plane is None or isinstance(plane, str):
+        from axor_langchain.plane import ENV_URL, PlaneLink
+        url = plane or os.environ.get(ENV_URL)
+        if not url:
+            return None, False
+        try:
+            return PlaneLink(url, node_id), True
+        except RuntimeError as exc:
+            if plane is None:  # env-driven: never break an agent over it
+                _log.warning("axor: %s set but %s", ENV_URL, exc)
+                return None, False
+            raise
+    return plane, False
+
+
 def _message_refs(msg) -> list[str]:
     """Refs an operator excision can name for a LangChain message: its id and,
     for a tool result, the tool_call_id it answers."""
@@ -989,6 +1010,7 @@ class _AxorGovernanceCore:
         tool_selection_stable: bool = True,
         token_cost_rates: Any | None = None,
         plane: Any | None = None,
+        node_id: str | None = None,
     ) -> None:
         profile = _normalize_optimization_profile(optimization_profile)
         profile_cfg = _OPTIMIZATION_PROFILES.get(profile or "", {})
@@ -1065,7 +1087,7 @@ class _AxorGovernanceCore:
 
         # Control Plane (axor-wrap PlaneAdmission or anything with the same
         # surface). None = no plane: every hook below is a no-op.
-        self._plane = plane
+        self._plane, self._owns_plane = _resolve_plane(plane, node_id)
         self._plane_poll = 0.05
         self._plane_calls = 0           # tool calls charged to the operator cap
         self._excised_refs: set[str] = set()
@@ -1753,6 +1775,16 @@ class _AxorGovernanceCore:
 
         return request.override(messages=messages) if changed else request
 
+    @property
+    def plane(self) -> Any:
+        return self._plane
+
+    def close(self) -> None:
+        """Close a Control-Plane link this middleware opened (delivers what is
+        queued first). Also runs at interpreter exit."""
+        if self._owns_plane and self._plane is not None:
+            self._plane.close()
+
     def _check_cancel(self, where: str) -> None:
         """Raise AxorCancelledError if cancellation has been requested.
 
@@ -2280,6 +2312,7 @@ class AxorMiddleware(_AxorGovernanceCore):
         tool_selection_stable: bool = True,
         token_cost_rates: Any | None = None,
         plane: Any | None = None,
+        node_id: str | None = None,
     ) -> None:
         if getattr(self, "_engines_ready", None) is not None:
             return
@@ -2311,4 +2344,5 @@ class AxorMiddleware(_AxorGovernanceCore):
             tool_selection_stable=tool_selection_stable,
             token_cost_rates=token_cost_rates,
             plane=plane,
+            node_id=node_id,
         )
