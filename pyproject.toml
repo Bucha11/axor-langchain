@@ -26,7 +26,11 @@ dependencies = [
     # self-consistent — it is THIS change that needs 0.9 as the floor: the new
     # import does not exist before it. Raising the ceiling required the migration.
     # Measured against an installed 0.12.0: 192 tests pass.
-    "axor-core>=0.9,<0.13",
+    "axor-core>=0.10.2,<0.13",
+    # the shared plane feeds (axor_wrap.observe) and link; core-only at base,
+    # so this adds no transport — [plane] does. Its floor (core 0.10.2) is
+    # this package's floor now.
+    "axor-wrap>=0.2.2,<0.3",
     "langchain>=1.0.0",
     "langgraph>=1.0.0",
 ]

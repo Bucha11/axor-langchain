@@ -35,6 +35,11 @@
   proposal lands in the plane's Health panel. Verified end to end against a
   local plane: drift → proposed cut → operator self-heal → cut in context →
   re-probe CONSISTENT → heal resolved.
+- The feeds (recorder, reputation, health check, experiments) and the
+  background link now live in axor-wrap (`axor_wrap.observe`,
+  `axor_wrap.plane.link`), shared with axor-claude; `axor_langchain.observe`
+  keeps only the LangChain-specific inputs. `axor-wrap>=0.2.2` is a base
+  dependency (core-only); the axor-core floor follows it to 0.10.2.
 - **Honesty experiments** (`[experiment]` extra = axor-eval): `faults=[...]`
   locally, or a `pending_experiment` commanded from the plane (test-bench nodes
   only), breaks the named tools on the next run with axor-eval's own

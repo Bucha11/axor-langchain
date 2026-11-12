@@ -119,7 +119,9 @@ def test_health_check_localizes_the_poisoned_tool_result(monkeypatch):
             ToolMessage("an ordinary rates table", tool_call_id="tc10"),
         ],
     )
-    body = asyncio.run(HealthCheck(probes=3).run(request=request, node_id="n1", run_id="r1"))
+    from axor_langchain.observe import health_inputs
+    body = asyncio.run(HealthCheck(probes=3).run(
+        node_id="n1", run_id="r1", **health_inputs(request)))
     assert body["overall_verdict"] == "DRIFT_DETECTED"
     assert body["repair_proposal"]["auto_excise"] == ["tc9"]
 

@@ -1998,8 +1998,10 @@ class _AxorGovernanceCore:
                 if not book.empty:
                     await plane.connector.post_reputation(book.snapshot())
             if probe_now:
-                body = await health.run(request=request, node_id=plane.node_id,
-                                        run_id=run_id)
+                from axor_langchain.observe import health_inputs
+                inputs = health_inputs(request)
+                body = None if inputs is None else await health.run(
+                    node_id=plane.node_id, run_id=run_id, **inputs)
                 if body is not None:
                     await plane.connector.post_health_check(body)
 
